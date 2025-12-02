@@ -33,12 +33,15 @@ def render_topology(alarms, root_cause_node):
                 for p in partners: graph.edge(p, node_id)
     return graph
 
-# --- Config読み込み ---
+# --- Config読み込み (修正済み) ---
 def load_config_by_id(device_id):
     path = f"configs/{device_id}.txt"
     if os.path.exists(path):
-        try: with open(path, "r", encoding="utf-8") as f: return f.read()
-        except: return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return None
     return None
 
 # --- UI構築 ---
@@ -131,7 +134,7 @@ with col1:
                     st.session_state.trigger_analysis = True
                     st.rerun()
 
-        # 診断結果表示（タブ形式に変更）
+        # 診断結果表示（タブ形式）
         if st.session_state.live_result:
             res = st.session_state.live_result
             if res["status"] == "SUCCESS":
@@ -159,7 +162,7 @@ with col2:
         
         system_prompt = ""
         if st.session_state.live_result:
-            # Liveモードの初期化（再起動時など）
+            # Liveモードの初期化
             live_data = st.session_state.live_result
             log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
             system_prompt = f"診断結果に基づきレポートを作成せよ。\nステータス: {live_data['status']}\nログ: {log_content}"
