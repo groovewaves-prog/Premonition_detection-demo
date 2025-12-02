@@ -7,9 +7,10 @@ from data import TOPOLOGY
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
 from network_ops import run_diagnostic_simulation
 
+# --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Live", page_icon="⚡", layout="wide")
 
-# --- トポロジー描画 ---
+# --- 関数: トポロジー図 ---
 def render_topology(alarms, root_cause_node):
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
@@ -33,15 +34,12 @@ def render_topology(alarms, root_cause_node):
                 for p in partners: graph.edge(p, node_id)
     return graph
 
-# --- Config読み込み (修正済み) ---
+# --- Config読み込み ---
 def load_config_by_id(device_id):
     path = f"configs/{device_id}.txt"
     if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception:
-            return None
+        try: with open(path, "r", encoding="utf-8") as f: return f.read()
+        except: return None
     return None
 
 # --- UI構築 ---
@@ -55,11 +53,28 @@ else:
 
 with st.sidebar:
     st.header("⚡ 運用モード選択")
+    
+    # ★追加: 新しいシナリオをリストに追加
+    # これらを選ぶと、AIがその場でログを捏造します
     selected_scenario = st.radio(
         "シナリオ:", 
-        ("正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害", "4. [Live] Cisco実機診断")
+        (
+            "正常稼働", 
+            "1. WAN全回線断", 
+            "2. FW片系障害", 
+            "3. L2SWサイレント障害",
+            "4. BGPルートフラッピング", # New
+            "5. FAN故障",             # New
+            "6. 電源故障",             # New
+            "7. メモリリーク",         # New
+            "8. [Live] Cisco実機診断"
+        )
     )
-    if not api_key:
+    
+    st.markdown("---")
+    if api_key:
+        st.success("API Connected")
+    else:
         st.warning("API Key Missing")
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
@@ -79,27 +94,38 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.trigger_analysis = False
     st.rerun()
 
-# --- アラーム生成 ---
+# --- アラーム生成 (シミュレーション) ---
 alarms = []
+
+# シナリオに応じたアラーム定義
+# 新規シナリオの場合は、WANルータを起点としたWarning/Criticalアラームを適当に発行
 if selected_scenario == "1. WAN全回線断":
     alarms = simulate_cascade_failure("WAN_ROUTER_01", TOPOLOGY)
 elif selected_scenario == "2. FW片系障害":
     alarms = [Alarm("FW_01_PRIMARY", "Heartbeat Loss", "WARNING")]
 elif selected_scenario == "3. L2SWサイレント障害":
     alarms = [Alarm("AP_01", "Connection Lost", "CRITICAL"), Alarm("AP_02", "Connection Lost", "CRITICAL")]
+elif selected_scenario in ["4. BGPルートフラッピング", "7. メモリリーク"]:
+    # 軽微なアラーム
+    alarms = [Alarm("WAN_ROUTER_01", "Syslog Pattern Match", "WARNING")]
+elif selected_scenario in ["5. FAN故障", "6. 電源故障"]:
+    # ハードウェアアラーム
+    alarms = [Alarm("WAN_ROUTER_01", "Environment Alert", "CRITICAL")]
 
 root_cause = None
+inference_result = None
 reason = ""
+
 if alarms:
     engine = CausalInferenceEngine(TOPOLOGY)
     res = engine.analyze_alarms(alarms)
     root_cause = res.root_cause_node
     reason = res.root_cause_reason
 
-# --- 画面レイアウト ---
+# --- メイン画面 ---
 col1, col2 = st.columns([1, 1])
 
-# 左カラム：トポロジー & 診断実行
+# 左カラム
 with col1:
     st.subheader("Network Status")
     st.graphviz_chart(render_topology(alarms, root_cause), use_container_width=True)
@@ -108,7 +134,7 @@ with col1:
         st.markdown(f'<div style="color:#d32f2f;background:#fdecea;padding:10px;border-radius:5px;">🚨 緊急アラート：{root_cause.id} ダウン</div>', unsafe_allow_html=True)
         st.caption(f"理由: {reason}")
     
-    is_live_mode = (selected_scenario == "4. [Live] Cisco実機診断")
+    is_live_mode = ("[Live]" in selected_scenario)
     
     if is_live_mode or root_cause:
         st.markdown("---")
@@ -119,8 +145,11 @@ with col1:
                 st.error("API Key Required")
             else:
                 with st.status("Agent Operating...", expanded=True) as status:
-                    st.write("🔌 Establishing Connection...")
-                    res = run_diagnostic_simulation(selected_scenario)
+                    st.write("🔌 Establishing Connection / Generating Simulation...")
+                    
+                    # 【変更点】APIキーを渡して、AIにログを作らせる
+                    res = run_diagnostic_simulation(selected_scenario, api_key)
+                    
                     st.session_state.live_result = res
                     
                     if res["status"] == "SUCCESS":
@@ -128,41 +157,34 @@ with col1:
                         st.write("🧹 Sanitizing Sensitive Information...")
                         status.update(label="Complete!", state="complete", expanded=False)
                     else:
-                        st.write("❌ Connection Failed.")
+                        st.write("❌ Connection Failed / Simulation Error.")
                         status.update(label="Target Unreachable", state="error", expanded=False)
                     
                     st.session_state.trigger_analysis = True
                     st.rerun()
 
-        # 診断結果表示（タブ形式）
         if st.session_state.live_result:
             res = st.session_state.live_result
             if res["status"] == "SUCCESS":
-                st.success("🛡️ **Data Sanitized**: 機密情報はマスク処理済み")
-                
-                # タブで生ログ（サニタイズ済）を見やすく表示
-                tab_log, tab_raw = st.tabs(["🔒 Sanitized Log", "🔍 Raw (Debug)"])
-                with tab_log:
+                st.success("🛡️ **Data Sanitized**: パスワード・IPアドレスをマスク処理しました。")
+                with st.expander("📄 取得ログ (Sanitized View)", expanded=True):
                     st.code(res["sanitized_log"], language="text")
-                with tab_raw:
-                    st.warning("管理権限が必要です")
             else:
                 st.error(f"診断結果: {res['error']}")
 
-# 右カラム：AIチャット
+# 右カラム
 with col2:
     st.subheader("AI Analyst Report")
     if not api_key: st.stop()
 
-    # 初期化
     should_start_chat = (st.session_state.chat_session is None) and (selected_scenario != "正常稼働")
+    
     if should_start_chat:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature": 0.0})
         
         system_prompt = ""
         if st.session_state.live_result:
-            # Liveモードの初期化
             live_data = st.session_state.live_result
             log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
             system_prompt = f"診断結果に基づきレポートを作成せよ。\nステータス: {live_data['status']}\nログ: {log_content}"
@@ -180,7 +202,6 @@ with col2:
                     st.session_state.messages.append({"role": "assistant", "content": res.text})
             except Exception as e: st.error(str(e))
 
-    # 診断後の追加分析 (トリガー)
     if st.session_state.trigger_analysis and st.session_state.chat_session:
         live_data = st.session_state.live_result
         log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
@@ -194,7 +215,7 @@ with col2:
         
         【出力要件】
         1. 接続結果 (成功/失敗)
-        2. ログ分析 (インターフェース状態、ルート情報など)
+        2. ログ分析 (インターフェース状態、ルート情報、環境変数など)
         3. 推奨アクション
         """
         st.session_state.messages.append({"role": "user", "content": "診断結果を分析してください。"})
@@ -208,7 +229,6 @@ with col2:
         st.session_state.trigger_analysis = False
         st.rerun()
 
-    # チャットUI
     chat_container = st.container(height=600)
     with chat_container:
         for msg in st.session_state.messages:
