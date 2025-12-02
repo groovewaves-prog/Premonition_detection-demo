@@ -11,7 +11,7 @@ from network_ops import run_diagnostic_simulation
 st.set_page_config(page_title="Antigravity Live", page_icon="⚡", layout="wide")
 
 # --- 関数: トポロジー図の生成 ---
-def render_topology(alarms, root_cause_node):
+def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
     graph.attr('node', shape='box', style='rounded,filled', fontname='Helvetica')
@@ -24,12 +24,20 @@ def render_topology(alarms, root_cause_node):
         fontcolor = "black"
         label = f"{node_id}\n({node.type})"
         
+        # 根本原因の強調 (エンジンの判定したSeverityに基づく)
         if root_cause_node and node_id == root_cause_node.id:
-            color = "#ffcdd2" # Root Cause Red
+            if root_severity == "CRITICAL":
+                color = "#ffcdd2" # Red (Down)
+            elif root_severity == "WARNING":
+                color = "#fff9c4" # Yellow (Warning)
+            else:
+                color = "#e8f5e9" # Green (Info)
+            
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
+            
         elif node_id in alarmed_ids:
-            color = "#fff9c4" # Alarm Yellow
+            color = "#fff9c4" # 連鎖アラームは黄色
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
     
@@ -67,30 +75,28 @@ else:
 with st.sidebar:
     st.header("⚡ 運用モード選択")
     
-    # シナリオ定義 (リストで見やすく整理)
     scenario_options = (
         "正常稼働",
-        # --- 広域・連携障害 ---
-        "1. [広域] WAN全回線断",
-        "2. [広域] FW片系障害",
-        "3. [広域] L2SWサイレント障害",
-        # --- WAN Router 個別 ---
+        "--- [広域障害] ---",
+        "1. WAN全回線断",
+        "2. FW片系障害",
+        "3. L2SWサイレント障害",
+        "--- [WAN Router] ---",
         "4. [WAN] BGPルートフラッピング",
         "5. [WAN] FAN故障",
         "6. [WAN] 電源故障",
         "7. [WAN] メモリリーク",
-        # --- FW 個別 ---
+        "--- [Firewall] ---",
         "8. [FW] FAN故障",
         "9. [FW] 電源故障",
         "10. [FW] メモリリーク",
-        # --- L2SW 個別 ---
+        "--- [L2 Switch] ---",
         "11. [L2SW] FAN故障",
         "12. [L2SW] 電源故障",
         "13. [L2SW] メモリリーク",
-        # --- Live ---
+        "--- [Live Mode] ---",
         "99. [Live] Cisco実機診断"
     )
-    
     selected_scenario = st.radio("シナリオを選択:", scenario_options)
     
     st.markdown("---")
@@ -101,7 +107,10 @@ with st.sidebar:
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
 
-# セッション状態管理
+if "---" in selected_scenario:
+    st.warning("カテゴリ見出しです。具体的なシナリオを選択してください。")
+    st.stop()
+
 if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
     st.session_state.messages = []
@@ -117,10 +126,9 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.trigger_analysis = False
     st.rerun()
 
-# --- アラーム生成 (シミュレーション) ---
+# --- アラーム生成 (実践的ロジックへの入力データ) ---
 alarms = []
 
-# 文字列判定でアラームを振り分け
 if "WAN全回線断" in selected_scenario:
     alarms = simulate_cascade_failure("WAN_ROUTER_01", TOPOLOGY)
 elif "FW片系障害" in selected_scenario:
@@ -128,56 +136,51 @@ elif "FW片系障害" in selected_scenario:
 elif "L2SWサイレント障害" in selected_scenario:
     alarms = [Alarm("AP_01", "Connection Lost", "CRITICAL"), Alarm("AP_02", "Connection Lost", "CRITICAL")]
 
-# --- WAN Router 個別障害 ---
+# ★改善点: UI側でSeverityを決め打ちせず、純粋なアラーム情報だけを作る
+# ロジックエンジンがこのSeverityを見て、トポロジーの色を決定する
 elif "[WAN]" in selected_scenario:
-    msg = "Hardware Error"
-    sev = "CRITICAL"
-    if "BGP" in selected_scenario:
-        msg = "BGP Neighbor Flapping"
-        sev = "WARNING"
-    elif "メモリ" in selected_scenario:
-        msg = "Memory High Utilization"
-        sev = "WARNING"
+    msg = "Device Warning"
+    sev = "WARNING" # FAN故障等はWarning
+    if "BGP" in selected_scenario: msg = "BGP Flapping"
+    elif "FAN" in selected_scenario: msg = "Fan Status: Fail"
+    elif "電源" in selected_scenario: msg = "Power Supply: Redundant Loss"
+    elif "メモリ" in selected_scenario: msg = "Memory High (90%)"
     alarms = [Alarm("WAN_ROUTER_01", msg, sev)]
 
-# --- FW 個別障害 ---
 elif "[FW]" in selected_scenario:
-    msg = "Hardware Alert"
-    sev = "CRITICAL"
-    if "メモリ" in selected_scenario:
-        msg = "Memory High"
-        sev = "WARNING"
-    alarms = [Alarm("FW_01_PRIMARY", msg, sev)]
+    # 同様に、FW単体の異常もWarningとして扱う
+    alarms = [Alarm("FW_01_PRIMARY", "Hardware Alert", "WARNING")]
 
-# --- L2SW 個別障害 ---
 elif "[L2SW]" in selected_scenario:
-    msg = "Environment Alert"
-    sev = "CRITICAL"
-    if "メモリ" in selected_scenario:
-        msg = "Memory Threshold Exceeded"
-        sev = "WARNING"
-    alarms = [Alarm("L2_SW_01", msg, sev)]
+    alarms = [Alarm("L2_SW_01", "Hardware Alert", "WARNING")]
 
 root_cause = None
 inference_result = None
 reason = ""
+root_severity = "CRITICAL" # デフォルト
 
 if alarms:
     engine = CausalInferenceEngine(TOPOLOGY)
-    res = engine.analyze_alarms(alarms)
-    root_cause = res.root_cause_node
-    reason = res.root_cause_reason
+    inference_result = engine.analyze_alarms(alarms)
+    root_cause = inference_result.root_cause_node
+    reason = inference_result.root_cause_reason
+    # ★重要: エンジンが判定したSeverityを取得する
+    root_severity = inference_result.severity
 
 # --- メイン画面 ---
 col1, col2 = st.columns([1, 1])
 
-# 左カラム
 with col1:
     st.subheader("Network Status")
-    st.graphviz_chart(render_topology(alarms, root_cause), use_container_width=True)
+    # ロジック判定結果のSeverityを渡す
+    st.graphviz_chart(render_topology(alarms, root_cause, root_severity), use_container_width=True)
     
     if root_cause:
-        st.markdown(f'<div style="color:#d32f2f;background:#fdecea;padding:10px;border-radius:5px;">🚨 緊急アラート：{root_cause.id} ダウン</div>', unsafe_allow_html=True)
+        if root_severity == "CRITICAL":
+            st.markdown(f'<div style="color:#d32f2f;background:#fdecea;padding:10px;border-radius:5px;">🚨 緊急アラート：{root_cause.id} ダウン</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div style="color:#856404;background:#fff3cd;padding:10px;border-radius:5px;">⚠️ 警告：{root_cause.id} 異常検知 (稼働中)</div>', unsafe_allow_html=True)
+        
         st.caption(f"理由: {reason}")
     
     is_live_mode = ("[Live]" in selected_scenario)
@@ -186,41 +189,38 @@ with col1:
         st.markdown("---")
         st.info("🛠 **自律調査エージェント**")
         
-        # ボタン: 診断実行
         if st.button("🚀 診断実行 (Auto-Diagnostic)", type="primary"):
             if not api_key:
                 st.error("API Key Required")
             else:
                 with st.status("Agent Operating...", expanded=True) as status:
-                    st.write("🔌 Establishing Connection / Generating Simulation...")
-                    
-                    # APIキーを渡してAIログ生成を実行
+                    st.write("🔌 Executing Diagnostics...")
                     res = run_diagnostic_simulation(selected_scenario, api_key)
-                    
                     st.session_state.live_result = res
                     
                     if res["status"] == "SUCCESS":
                         st.write("✅ Data Acquired.")
-                        st.write("🧹 Sanitizing Sensitive Information...")
+                        st.write("🧹 Sanitizing...")
                         status.update(label="Complete!", state="complete", expanded=False)
+                    elif res["status"] == "SKIPPED":
+                        st.warning("No action needed.")
+                        status.update(label="Skipped", state="complete")
                     else:
-                        st.write("❌ Connection Failed / Simulation Error.")
+                        st.write("❌ Check Failed.")
                         status.update(label="Target Unreachable", state="error", expanded=False)
                     
-                    # エラーの原因だったインデントを修正しました
                     st.session_state.trigger_analysis = True
                     st.rerun()
 
         if st.session_state.live_result:
             res = st.session_state.live_result
             if res["status"] == "SUCCESS":
-                st.success("🛡️ **Data Sanitized**: パスワード・IPアドレスをマスク処理しました。")
-                with st.expander("📄 取得ログ (Sanitized View)", expanded=True):
+                st.success("🛡️ **Data Sanitized**: 機密情報はマスク処理済み")
+                with st.expander("📄 取得ログ (Sanitized)", expanded=True):
                     st.code(res["sanitized_log"], language="text")
-            else:
+            elif res["status"] == "ERROR":
                 st.error(f"診断結果: {res['error']}")
 
-# 右カラム
 with col2:
     st.subheader("AI Analyst Report")
     if not api_key: st.stop()
@@ -238,7 +238,7 @@ with col2:
             system_prompt = f"診断結果に基づきレポートを作成せよ。\nステータス: {live_data['status']}\nログ: {log_content}"
         elif root_cause:
             conf = load_config_by_id(root_cause.id)
-            system_prompt = f"障害報告: {root_cause.id}。理由: {reason}。"
+            system_prompt = f"障害報告: {root_cause.id} ({root_cause.type})\n理由: {reason}\n重要度: {root_severity}"
             if conf: system_prompt += f"\nConfig:\n{conf}"
         
         if system_prompt:
@@ -263,8 +263,8 @@ with col2:
         
         【出力要件】
         1. 接続結果 (成功/失敗)
-        2. ログ分析 (インターフェース状態、ルート情報、環境変数など)
-        3. 推奨アクション
+        2. ログ分析 (エラーメッセージやステータスの確認)
+        3. 推奨アクション (交換、再起動、静観など)
         """
         st.session_state.messages.append({"role": "user", "content": "診断結果を分析してください。"})
         
