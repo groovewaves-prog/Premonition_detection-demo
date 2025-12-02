@@ -1,59 +1,96 @@
 """
-Google Antigravity AIOps Agent - Network Operations Module (Stub Version)
-実機接続をシミュレーションし、サニタイズ機能を提供します。
+Google Antigravity AIOps Agent - Network Operations Module
+Cisco DevNet Sandbox (Nexus 9000) への接続とサニタイズを担当
 """
 import re
-import os
 import time
+from netmiko import ConnectHandler
+
+# Cisco DevNet Always-On Sandbox (Nexus 9000)
+SANDBOX_DEVICE = {
+    'device_type': 'cisco_nxos',    # Nexus OS
+    'host': 'sandbox-nxos-1.cisco.com',
+    'username': 'admin',
+    'password': 'Admin_1234!',
+    'port': 22,
+    # 接続安定化オプション
+    'global_delay_factor': 2,
+    'banner_timeout': 30,
+    'conn_timeout': 30,
+}
 
 def sanitize_output(text: str) -> str:
     """
-    セキュリティ対策: 機密情報をマスクする
+    機密情報をマスク処理します (強化版)
     """
-    # Cisco Type 7 password mask
-    text = re.sub(r'(password|secret) \d+ \S+', r'\1 <HIDDEN>', text)
-    # SNMP communities
-    text = re.sub(r'community \S+', 'community <HIDDEN>', text)
-    # Global IP mask (簡易例: 203.0.113.x をマスク)
-    text = re.sub(r'203\.0\.113\.\d+', '<Global-IP>', text)
-    return text
+    rules = [
+        # 1. Passwords / Secrets / Community Strings
+        (r'(password|secret) \d+ \S+', r'\1 <HIDDEN_PASSWORD>'),
+        (r'(encrypted password) \S+', r'\1 <HIDDEN_PASSWORD>'),
+        (r'(snmp-server community) \S+', r'\1 <HIDDEN_COMMUNITY>'),
+        (r'(username \S+ privilege \d+ secret \d+) \S+', r'\1 <HIDDEN_SECRET>'),
+        
+        # 2. Public IP Masking (プライベートIPは残し、グローバルIPのみ隠す)
+        (r'\b(?!(?:10|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.)\d{1,3}\.(?:\d{1,3}\.){2}\d{1,3}\b', '<MASKED_PUBLIC_IP>'),
+        
+        # 3. MAC Address
+        (r'([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}', '<MASKED_MAC>'),
+    ]
+    
+    sanitized_text = text
+    for pattern, replacement in rules:
+        sanitized_text = re.sub(pattern, replacement, sanitized_text)
+    return sanitized_text
 
 def run_diagnostic_simulation(scenario_type):
     """
-    SSH接続をシミュレーションするスタブ関数
+    実機接続を試行し、失敗した場合はシミュレーション結果を返すハイブリッド関数
     """
-    # 接続している感を出すためのウェイト
-    time.sleep(2.0)
-    
-    status = "SUCCESS"
-    raw_output = ""
-    error_msg = None
-
-    # シナリオに応じた挙動の分岐
+    # シミュレーション用シナリオの場合は即座にエラー等を返す
     if scenario_type == "1. WAN全回線断":
-        # 完全に落ちている場合 -> SSH接続タイムアウトをシミュレーション
-        status = "ERROR"
-        error_msg = "Connection timed out (Host unreachable)"
-        raw_output = "SSH Connection failed. Target is not responding to Ping/SSH."
+        return {
+            "status": "ERROR",
+            "sanitized_log": "Connection timed out (Host unreachable)",
+            "error": "Timeout"
+        }
+    
+    # Liveモードの場合は実機接続に挑戦
+    if scenario_type == "4. [Live] Cisco実機診断":
+        commands = [
+            "terminal length 0",
+            "show version",
+            "show interface brief",
+            "show ip route",
+        ]
         
-    elif scenario_type == "4. [Live] Cisco実機診断":
-        # ログが取れる場合 -> ファイルから読み込み
-        log_path = "logs/sample_cisco_log.txt"
-        if os.path.exists(log_path):
-            with open(log_path, "r", encoding="utf-8") as f:
-                raw_output = f.read()
-            # ダミーのコマンド実行履歴を付与
-            raw_output = f"[Command] show run\n{raw_output}\n[Command] show ip int brief\nInterface GE1: UP/UP"
-        else:
-            # ファイルがない場合のフォールバック
-            raw_output = "hostname WAN_ROUTER_01\npassword 7 999999\n(Dummy Log)"
-            
-    else:
-        # その他のケース
-        raw_output = "No diagnostic data available for this scenario."
+        raw_output = ""
+        status = "SUCCESS"
+        error_msg = None
 
-    return {
-        "status": status,
-        "sanitized_log": sanitize_output(raw_output),
-        "error": error_msg
-    }
+        try:
+            with ConnectHandler(**SANDBOX_DEVICE) as ssh:
+                # Nexusはenableモード不要な場合が多いが念のため
+                if not ssh.check_enable_mode():
+                    ssh.enable()
+                
+                prompt = ssh.find_prompt()
+                raw_output += f"Connected to: {prompt}\n"
+
+                for cmd in commands:
+                    output = ssh.send_command(cmd)
+                    raw_output += f"\n{'='*30}\n[Command] {cmd}\n{output}\n"
+                    time.sleep(0.5)
+                    
+        except Exception as e:
+            # 実機接続失敗時のフォールバック (デモが止まらないように)
+            status = "ERROR"
+            error_msg = str(e)
+            raw_output = f"SSH Connection Failed: {error_msg}\n(Sandbox may be busy or offline.)"
+
+        return {
+            "status": status,
+            "sanitized_log": sanitize_output(raw_output),
+            "error": error_msg
+        }
+        
+    return {"status": "UNKNOWN", "sanitized_log": "", "error": "Unknown Scenario"}
