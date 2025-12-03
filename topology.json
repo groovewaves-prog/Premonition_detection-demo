@@ -3,61 +3,70 @@
     "layer": 1,
     "type": "ROUTER",
     "parent_id": null,
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": "PSU"
   },
   "FW_01_PRIMARY": {
     "layer": 2,
     "type": "FIREWALL",
     "parent_id": "WAN_ROUTER_01",
-    "redundancy_group": "FW_HA_GROUP"
+    "redundancy_group": "FW_HA_GROUP",
+    "internal_redundancy": "PSU"
   },
   "FW_01_SECONDARY": {
     "layer": 2,
     "type": "FIREWALL",
     "parent_id": "WAN_ROUTER_01",
-    "redundancy_group": "FW_HA_GROUP"
+    "redundancy_group": "FW_HA_GROUP",
+    "internal_redundancy": "PSU"
   },
   "CORE_SW_01": {
     "layer": 3,
     "type": "SWITCH",
     "parent_id": "FW_01_PRIMARY",
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": "PSU"
   },
   "L2_SW_01": {
     "layer": 4,
     "type": "SWITCH",
     "parent_id": "CORE_SW_01",
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": "PSU"
   },
   "L2_SW_02": {
     "layer": 4,
     "type": "SWITCH",
     "parent_id": "CORE_SW_01",
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": "PSU"
   },
   "AP_01": {
     "layer": 5,
     "type": "ACCESS_POINT",
     "parent_id": "L2_SW_01",
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": null
   },
   "AP_02": {
     "layer": 5,
     "type": "ACCESS_POINT",
-    "L2_SW_01": null,
     "parent_id": "L2_SW_01",
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": null
   },
   "AP_03": {
     "layer": 5,
     "type": "ACCESS_POINT",
     "parent_id": "L2_SW_02",
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": null
   },
   "AP_04": {
     "layer": 5,
     "type": "ACCESS_POINT",
     "parent_id": "L2_SW_02",
-    "redundancy_group": null
+    "redundancy_group": null,
+    "internal_redundancy": null
   }
 }
