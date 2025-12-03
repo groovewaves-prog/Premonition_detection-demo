@@ -34,95 +34,129 @@ def sanitize_output(text: str) -> str:
 
 def generate_fake_log_by_ai(scenario_name, api_key):
     """
-    シナリオに応じた具体的かつ矛盾のないログを生成する
+    機器タイプと障害タイプを動的に組み合わせて、矛盾のないログを一括生成する
     """
     if not api_key: return "Error: API Key Missing"
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.0-flash")
     
-    # 基本設定: デュアル電源を持つ中規模ルータを指定し、矛盾を防ぐ
-    target_device_model = "Cisco ISR 4451-X (Dual Power Supply Support)"
-    
-    # シナリオごとの「演技指導」 (必須出力内容の定義)
-    specific_instructions = ""
-    
-    # 1. 電源障害 (片系/両系)
-    if "電源" in scenario_name:
-        if "片系" in scenario_name:
-            specific_instructions = """
-            【必須要件: 電源片系障害】
-            1. `show environment` コマンドの結果で以下のように出力すること。
-               - Power Supply Module 0: Status **Fail** / **Input Failure** (障害発生)
-               - Power Supply Module 1: Status **OK** / **Good** (正常稼働)
-            2. インターフェースは全て **UP/UP** (電源冗長により稼働継続)。
-            3. Pingは **成功**。
-            4. Syslogに `%PEM-3-PEMFAIL: The power supply 0 is faulty` を含める。
-            """
-        elif "両系" in scenario_name:
-            specific_instructions = """
-            【必須要件: 電源両系喪失】
-            1. ログは「コンソール接続不可」「SSH接続タイムアウト」のエラーメッセージのみとするか、
-               あるいは再起動直後の `System returned to ROM by power-on` のようなログにする。
-            2. 基本的に通信断状態。
-            """
+    # --- 1. Device Context (機器の特定) ---
+    # シナリオ名に含まれるタグから、適切なハードウェアモデルとOSを決定する
+    if "[FW]" in scenario_name:
+        device_model = "Cisco ASA 5555-X (Adaptive Security Appliance)"
+        os_type = "Cisco ASA Software"
+        target_name = "FW_01_PRIMARY"
+    elif "[L2SW]" in scenario_name:
+        device_model = "Cisco Catalyst 9300 Series Switch (Dual Power Supply)"
+        os_type = "Cisco IOS-XE"
+        target_name = "L2_SW_01"
+    else:
+        # Default / [WAN]
+        device_model = "Cisco ISR 4451-X Router (Dual Power Supply)"
+        os_type = "Cisco IOS-XE"
+        target_name = "WAN_ROUTER_01"
 
-    # 2. FAN故障
+    # --- 2. Failure Context (障害状態の定義) ---
+    # 機器の種類に関わらず共通する「あるべき状態」を定義
+    
+    status_instructions = ""
+    
+    # A. 電源障害 (片系)
+    if "電源" in scenario_name and "片系" in scenario_name:
+        status_instructions = """
+        【状態定義: 電源冗長稼働中 (片系ダウン)】
+        1. ハードウェア状態:
+           - Power Supply 1 (A): **Faulty / Failed / No Input** (故障)
+           - Power Supply 2 (B): **OK / Good / Active** (正常)
+        2. サービス影響:
+           - インターフェースは全て **UP/UP** (電源冗長によりダウンしていない)。
+           - Ping疎通は **成功**。
+           - システム稼働時間はリセットされていない (Uptime継続)。
+        3. ログ出力:
+           - 環境モニタリングコマンド (`show environment`, `show env all` 等) で上記状態を示すこと。
+           - Syslogに `%PEM-3-PEMFAIL` や `%PLATFORM_ENV-1-PS_FAIL` 等のエラーを含めること。
+        """
+
+    # B. 電源障害 (両系) -> これは全断と同じ扱い
+    elif "電源" in scenario_name and "両系" in scenario_name:
+        status_instructions = """
+        【状態定義: 電源喪失 (システムダウン)】
+        1. ログ内容:
+           - 本来はログ取得不可だが、診断ツールとして「Connection Refused」または「Console not responding」のエラーを出力するか、
+           - あるいは「再起動直後のBootログ(System returned to ROM by power-on)」を出力すること。
+        """
+
+    # C. FAN故障
     elif "FAN" in scenario_name:
-        specific_instructions = """
-        【必須要件: FAN故障】
-        1. `show environment` コマンドの結果で:
-           - Fan 0: **Faulty** / **Stop** (回転数 0 RPM)
-           - Fan 1: OK
-           - System Temperature: Warning (温度上昇中)
-        2. インターフェースは **UP/UP** (稼働継続)。
-        3. Syslogに `%ENVMON-3-FAN_FAILED` を含める。
+        status_instructions = """
+        【状態定義: ファン故障 (稼働中)】
+        1. ハードウェア状態:
+           - Fan Tray 1: **Faulty / Failure** (回転数異常)
+           - System Temperature: **Warning / Minor Alert** (上昇傾向だがCriticalではない)
+        2. サービス影響:
+           - インターフェースは **UP/UP**。
+           - Ping **成功**。
+        3. ログ出力:
+           - `show environment` 等でFanステータス異常を表示。
+           - Syslogに `%ENVMON-3-FAN_FAILED` 等を含める。
         """
 
-    # 3. メモリリーク
+    # D. メモリリーク
     elif "メモリ" in scenario_name:
-        specific_instructions = """
-        【必須要件: メモリリーク】
-        1. `show processes memory` コマンドの結果で:
-           - Processor Pool Total: ... Used: **98%** Free: **2%**
-           - 特定のプロセス (例: "BGP Router" や "Chunk Manager") が大量に消費している様子。
-        2. インターフェースは UP だが、反応が遅いことを示唆するログがあれば尚良い。
-        3. Syslogに `%SYS-2-MALLOCFAIL` を含める。
+        status_instructions = """
+        【状態定義: メモリ枯渇 (稼働中)】
+        1. システム状態:
+           - Total Memory Used: **96% - 99%**
+           - Warning: Processor memory is low.
+        2. サービス影響:
+           - インターフェースは **UP** だが、反応が遅い可能性あり。
+           - Ping **成功**。
+        3. ログ出力:
+           - `show processes memory` (またはASAなら `show memory`) で枯渇を表示。
+           - Syslogに `%SYS-2-MALLOCFAIL` 等を含める。
         """
 
-    # 4. BGPフラッピング
+    # E. BGPフラッピング
     elif "BGP" in scenario_name:
-        specific_instructions = """
-        【必須要件: BGPフラッピング】
-        1. `show ip bgp summary` の結果で:
-           - Neighbor 203.0.113.2 の State/PfxRcd が **Idle** と **Active** を繰り返している。
-           - Up/Down 時間が "00:00:05" のように非常に短い。
-        2. 物理インターフェースは UP/UP。
-        3. Syslogに `%BGP-5-ADJCHANGE: neighbor ... Down` と `Up` が交互に出ているログを含める。
+        status_instructions = """
+        【状態定義: BGP不安定】
+        1. プロトコル状態:
+           - BGP Neighbor State: **Active / Idle / Established** を頻繁に遷移。
+           - Uptimeが数秒～数分と短い。
+        2. サービス影響:
+           - 物理インターフェースは **UP/UP**。
+           - Ping **成功**。
+        3. ログ出力:
+           - `show ip bgp summary` でフラッピングを確認できること。
+           - Syslogに `%BGP-5-ADJCHANGE` (Up/Down) が多数記録されていること。
         """
-
-    # 5. WAN全回線断
+    
+    # F. 全回線断
     elif "全回線断" in scenario_name:
-        specific_instructions = """
-        【必須要件: WAN全断】
-        1. `show ip interface brief` の結果で:
-           - GigabitEthernet0/0 (WAN): **DOWN/DOWN**
-        2. Ping 8.8.8.8 は **100% loss**。
+        status_instructions = """
+        【状態定義: 完全通信断】
+        1. インターフェース: **DOWN/DOWN**
+        2. Ping: **100% Loss**
         """
 
+    # --- プロンプト構築 ---
     prompt = f"""
-    あなたはCiscoネットワーク機器のシミュレーターです。
-    以下のシナリオに基づき、エンジニアが調査した際のコマンド実行ログを生成してください。
+    あなたはネットワーク機器のCLIシミュレーターです。
+    指定された機種と障害状態に基づいて、エンジニアがトラブルシューティングを行った際の「コマンド実行結果ログ」を生成してください。
 
+    **対象機器モデル**: {device_model}
+    **OSタイプ**: {os_type}
+    **ホスト名**: {target_name}
     **発生シナリオ**: {scenario_name}
-    **対象機器モデル**: {target_device_model}
 
-    {specific_instructions}
+    {status_instructions}
 
-    **共通ルール**:
-    - `show version`, `show ip interface brief`, `show environment` (ハードウェア系の場合) 等のコマンド実行結果を含める。
-    - 解説やMarkdown装飾は不要。CLIの生テキストのみ出力せよ。
-    - 矛盾する情報（例: 電源故障なのにAll OKなど）は絶対に出力しないこと。
+    **出力要件**:
+    1. 対象OS ({os_type}) に適したコマンドを使用すること。
+       (例: IOSなら `show ip int br`, ASAなら `show interface ip brief`, NX-OSなら `show interface brief`)
+    2. 解説やMarkdown装飾は不要。**CLIの生テキストのみ**を出力すること。
+    3. **絶対に矛盾させないこと** (例: 片系障害なのにインターフェースをダウンさせない)。
     """
     
     try:
@@ -158,20 +192,14 @@ def run_diagnostic_simulation(scenario_type, api_key=None):
             error_msg = str(e)
             raw_output = f"Real Device Connection Failed: {error_msg}"
             
-    # 全断・サイレント（接続不可系）のシミュレーション
-    # ※ここで弾くとAI生成ログが作れないので、AIにエラーログを作らせる方針に変更しても良いが、
-    #  今回は「接続タイムアウト」を即時返す仕様を維持する
-    elif "全回線断" in scenario_type and "WAN" not in scenario_type: # WAN個別ではない広域障害の場合
+    # 全断・サイレント・両系電源障害（接続不可系）
+    # AIにエラーログを作らせるより、ここで明示的にTimeoutを返したほうが確実
+    elif "全回線断" in scenario_type or "サイレント" in scenario_type or "両系" in scenario_type:
         status = "ERROR"
         error_msg = "Connection timed out"
-        raw_output = "SSH Connection Failed. Host Unreachable."
-        
-    elif "サイレント" in scenario_type:
-        status = "ERROR"
-        error_msg = "Connection timed out"
-        raw_output = "SSH Connection Failed. Host Unreachable."
+        raw_output = "SSH Connection Failed. Host Unreachable. (No Response from Console)"
 
-    # その他（AI生成）
+    # その他のログ取得可能系（片系障害、FAN、メモリ、BGP）
     else:
         if api_key:
             raw_output = generate_fake_log_by_ai(scenario_type, api_key)
