@@ -1,6 +1,6 @@
 """
-Google Antigravity AIOps Agent - ロジックモジュール (Production Ready)
-根本原因分析および重要度(Severity)の動的判定ロジックを実装。
+Google Antigravity AIOps Agent - ロジックモジュール (Message Preservation)
+HA構成時の判定において、具体的なアラームメッセージを保持するように修正。
 """
 
 from typing import List, Dict, Set, Optional
@@ -19,7 +19,6 @@ class InferenceResult:
     root_cause_reason: str
     sop_key: str
     related_alarms: List[Alarm]
-    # ★追加: 推論された障害の深刻度
     severity: str = "CRITICAL"
 
 class CausalInferenceEngine:
@@ -27,15 +26,10 @@ class CausalInferenceEngine:
         self.topology = topology
 
     def analyze_alarms(self, alarms: List[Alarm]) -> InferenceResult:
-        """
-        アラームリストを分析し、根本原因とその深刻度を特定する。
-        """
         alarmed_device_ids = {a.device_id for a in alarms}
-        
-        # アラーム辞書作成（ID -> Alarmオブジェクト）: 深刻度判定に使用
+        # アラームIDからメッセージを引けるようにマップ化
         alarm_map = {a.device_id: a for a in alarms}
 
-        # 1. 階層ルール: レイヤー順にソートして最上位を特定
         sorted_alarms = sorted(
             alarms, 
             key=lambda a: self.topology[a.device_id].layer if a.device_id in self.topology else 999
@@ -50,48 +44,53 @@ class CausalInferenceEngine:
         if not top_node:
              return InferenceResult(None, "不明なデバイス", "DEFAULT", alarms, "UNKNOWN")
 
-        # --- 判定ロジック ---
-
         # A. 冗長性ルール (HA構成)
         if top_node.redundancy_group:
-            return self._analyze_redundancy(top_node, alarmed_device_ids, alarms)
+            # alarm_mapを渡して、具体的なメッセージを取得できるようにする
+            return self._analyze_redundancy(top_node, alarmed_device_ids, alarms, alarm_map)
 
-        # B. サイレント障害推論 (親ダウン)
+        # B. サイレント障害推論
         if top_node.parent_id:
             silent_res = self._check_silent_failure_for_parent(top_node.parent_id, alarmed_device_ids)
             if silent_res:
                 return silent_res
 
-        # C. 単一機器障害 (階層ルールによる特定)
-        # ここで、元のアラームの深刻度(Critical/Warning)をそのまま引き継ぐ
+        # C. 単一機器障害
         root_severity = top_alarm.severity
-        
         return InferenceResult(
             root_cause_node=top_node,
-            root_cause_reason=f"階層ルール: 最上位レイヤーのデバイス {top_node.id} でアラーム検知 ({top_alarm.message})",
+            root_cause_reason=f"階層ルール: 最上位デバイス {top_node.id} でアラーム検知。詳細: [{top_alarm.message}]",
             sop_key="HIERARCHY_FAILURE",
             related_alarms=alarms,
-            severity=root_severity # ★入力アラームの深刻度を反映
+            severity=root_severity
         )
 
-    def _analyze_redundancy(self, node: NetworkNode, alarmed_ids: Set[str], alarms: List[Alarm]) -> InferenceResult:
+    def _analyze_redundancy(self, node: NetworkNode, alarmed_ids: Set[str], alarms: List[Alarm], alarm_map: Dict[str, Alarm]) -> InferenceResult:
         group_members = [n for n in self.topology.values() if n.redundancy_group == node.redundancy_group]
         down_members = [n for n in group_members if n.id in alarmed_ids]
         
+        # 障害の詳細メッセージを取得 (例: "Fan Fail", "Power Supply Failed")
+        error_details = []
+        for m in down_members:
+            if m.id in alarm_map:
+                error_details.append(f"{m.id}: {alarm_map[m.id].message}")
+        details_str = ", ".join(error_details)
+
         if len(down_members) == len(group_members):
-            # 両系ダウン -> サービス影響あり (CRITICAL)
+            # 両系ダウン
             return InferenceResult(
                 root_cause_node=node,
-                root_cause_reason=f"冗長性ルール: HAグループ {node.redundancy_group} の全メンバーがダウンしています。",
+                root_cause_reason=f"冗長性ルール: HAグループ {node.redundancy_group} 全停止。詳細: [{details_str}]",
                 sop_key="HA_TOTAL_FAILURE",
                 related_alarms=alarms,
                 severity="CRITICAL"
             )
         else:
-            # 片系ダウン -> サービス稼働中 (WARNING)
+            # 片系ダウン
             return InferenceResult(
                 root_cause_node=node,
-                root_cause_reason=f"冗長性ルール: HAグループ {node.redundancy_group} で単一ノード障害が発生しました。フェイルオーバーは有効です。",
+                # 【修正】ここで具体的なアラーム内容(details_str)を含める
+                root_cause_reason=f"冗長性ルール: HAグループ {node.redundancy_group} 片系障害 (稼働継続)。検知内容: [{details_str}]",
                 sop_key="HA_PARTIAL_FAILURE",
                 related_alarms=alarms,
                 severity="WARNING"
@@ -106,31 +105,11 @@ class CausalInferenceEngine:
         children_down = sum(1 for c in children if c.id in alarmed_ids)
         
         if len(children) > 0 and children_down == len(children):
-             # 親が死んでいると推測される場合は CRITICAL
              return InferenceResult(
                 root_cause_node=parent_node,
-                root_cause_reason=f"サイレント障害推論: 親デバイス {parent_id} は沈黙していますが、配下の子デバイスが全滅しています。",
+                root_cause_reason=f"サイレント障害推論: 親デバイス {parent_id} 無応答、配下全滅。電源断またはハングアップの疑い。",
                 sop_key="SILENT_FAILURE",
                 related_alarms=[],
                 severity="CRITICAL"
             )
         return None
-
-# シミュレーター機能
-def simulate_cascade_failure(root_cause_id: str, topology: Dict[str, NetworkNode]) -> List[Alarm]:
-    generated_alarms = []
-    generated_alarms.append(Alarm(root_cause_id, "Interface Down", "CRITICAL"))
-    
-    queue = [root_cause_id]
-    processed = {root_cause_id}
-    
-    while queue:
-        current_parent_id = queue.pop(0)
-        children = [n for n in topology.values() if n.parent_id == current_parent_id]
-        for child in children:
-            if child.id not in processed:
-                generated_alarms.append(Alarm(child.id, "Unreachable", "WARNING"))
-                queue.append(child.id)
-                processed.add(child.id)
-                
-    return generated_alarms
