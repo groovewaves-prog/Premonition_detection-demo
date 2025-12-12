@@ -10,13 +10,13 @@ from network_ops import run_diagnostic_simulation, generate_config_from_intent, 
 # --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Live", page_icon="⚡", layout="wide")
 
-# --- 関数: トポロジー図 ---
+# --- 関数: トポロジー図の生成 ---
 def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
     graph.attr('node', shape='box', style='rounded,filled', fontname='Helvetica')
     
-    alarmed_ids = {a.device_id for a in alarms} if alarms else set()
+    alarmed_ids = {a.device_id for a in alarms}
     
     for node_id, node in TOPOLOGY.items():
         color = "#e8f5e9" # Default Green
@@ -24,22 +24,29 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
         fontcolor = "black"
         label = f"{node_id}\n({node.type})"
         
-        # Vendor情報の表示を追加
+        # メタデータの表示
+        red_type = node.metadata.get("redundancy_type")
+        if red_type:
+            label += f"\n[{red_type} Redundancy]"
+        
         vendor = node.metadata.get("vendor")
         if vendor:
             label += f"\n[{vendor}]"
 
+        # 根本原因の強調
         if root_cause_node and node_id == root_cause_node.id:
             if root_severity == "CRITICAL":
-                color = "#ffcdd2"
+                color = "#ffcdd2" # Red
             elif root_severity == "WARNING":
-                color = "#fff9c4"
+                color = "#fff9c4" # Yellow
             else:
                 color = "#e8f5e9"
+            
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
+            
         elif node_id in alarmed_ids:
-            color = "#fff9c4"
+            color = "#fff9c4" # 連鎖アラーム
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
     
@@ -78,14 +85,15 @@ else:
 with st.sidebar:
     st.header("⚡ 運用モード選択")
     
-    # モード切り替え
-    app_mode = st.radio("機能選択:", ("🚨 障害対応 (AIOps)", "🔧 設定生成 (Day 1)"))
+    # ★変更: 名称をシンプル化
+    app_mode = st.radio("機能選択:", ("🚨 障害対応", "🔧 設定生成"))
     
     st.markdown("---")
     
     selected_scenario = "正常稼働"
     
-    if app_mode == "🚨 障害対応 (AIOps)":
+    # ★変更: 条件分岐も新しい名称に合わせる
+    if app_mode == "🚨 障害対応":
         SCENARIO_MAP = {
             "基本・広域障害": ["正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害"],
             "WAN Router": ["4. [WAN] 電源障害：片系", "5. [WAN] 電源障害：両系", "6. [WAN] BGPルートフラッピング", "7. [WAN] FAN故障", "8. [WAN] メモリリーク"],
@@ -103,7 +111,7 @@ with st.sidebar:
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
 
-# --- セッション管理 (モード切替時のリセット) ---
+# --- セッション管理 ---
 if "current_mode" not in st.session_state:
     st.session_state.current_mode = app_mode
     st.session_state.messages = []
@@ -113,17 +121,15 @@ if "current_mode" not in st.session_state:
 
 if st.session_state.current_mode != app_mode:
     st.session_state.current_mode = app_mode
-    st.session_state.messages = [] # チャットクリア
+    st.session_state.messages = [] # モード切替時にチャットクリア
     st.rerun()
 
 # ==========================================
-# モードA: 障害対応 (AIOps)
+# モードA: 障害対応
 # ==========================================
-if app_mode == "🚨 障害対応 (AIOps)":
-    # 以前のロジック (省略せず記述)
-    # ... (前回のコードと同じ内容) ...
+if app_mode == "🚨 障害対応":
     
-    # 既存コードの再利用 (セッションリセット処理)
+    # シナリオ変更時のリセット処理
     if "current_scenario" not in st.session_state:
         st.session_state.current_scenario = "正常稼働"
     
@@ -237,7 +243,8 @@ if app_mode == "🚨 障害対応 (AIOps)":
         should_start_chat = (st.session_state.chat_session is None) and (selected_scenario != "正常稼働")
         if should_start_chat:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature": 0.0})
+            # ★変更: gemini-1.5-flash に戻す
+            model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"temperature": 0.0})
             
             system_prompt = ""
             if st.session_state.live_result:
@@ -296,53 +303,37 @@ if app_mode == "🚨 障害対応 (AIOps)":
 # ==========================================
 # モードB: 設定生成 (Day 1)
 # ==========================================
-elif app_mode == "🔧 設定生成 (Day 1)":
+elif app_mode == "🔧 設定生成":
     st.subheader("🔧 Intent-Based Config Generator")
     
     c1, c2 = st.columns([1, 1])
     
     with c1:
         st.info("自然言語の指示(Intent)から、メーカー仕様に合わせたConfigを自動生成します。")
-        
-        # 1. ターゲット選択
         target_id = st.selectbox("対象機器を選択:", list(TOPOLOGY.keys()))
         target_node = TOPOLOGY[target_id]
-        
-        # ベンダー情報の表示
         vendor = target_node.metadata.get("vendor", "Unknown")
-        os_type = target_node.metadata.get("os", "Unknown")
-        st.caption(f"Device Info: {vendor} / {os_type}")
+        st.caption(f"Device Info: {vendor}")
         
-        # 現在のConfig表示
         current_conf = load_config_by_id(target_id)
-        with st.expander("現在のConfigを確認 (Reference)"):
-            if current_conf:
-                st.code(current_conf)
-            else:
-                st.warning("Configファイルがありません。新規作成として扱います。")
-                current_conf = "(No current config)"
+        with st.expander("現在のConfigを確認"):
+            st.code(current_conf if current_conf else "(No current config)")
 
-        # 2. Intent入力
-        intent = st.text_area("やりたいこと (Intent):", height=150, 
-                             placeholder="例: Gi0/1にVLAN100(Guest)を割り当てて。IPは192.168.100.1/24で。")
+        intent = st.text_area("Intent:", height=150, placeholder="例: Gi0/1にVLAN100を割り当てて。")
         
-        # 生成ボタン
-        if st.button("✨ Config生成 (Generate)", type="primary"):
-            if not api_key:
-                st.error("API Key Required")
-            elif not intent:
-                st.warning("Intentを入力してください")
+        if st.button("✨ Config生成", type="primary"):
+            if not api_key or not intent:
+                st.error("API Key or Intent Missing")
             else:
-                with st.spinner("Gemini is generating configuration..."):
+                with st.spinner("Generating..."):
                     generated_conf = generate_config_from_intent(target_node, current_conf, intent, api_key)
                     st.session_state.generated_conf = generated_conf
 
     with c2:
         st.subheader("📝 Generated Config")
-        
         if "generated_conf" in st.session_state:
             st.markdown(st.session_state.generated_conf)
-            st.success("生成完了。内容を確認してNetmiko等で投入してください。")
+            st.success("生成完了")
         else:
             st.info("左側のフォームから指示を入力してください。")
 
@@ -355,4 +346,3 @@ elif app_mode == "🔧 設定生成 (Day 1)":
                  with st.spinner("Generating..."):
                      cmds = generate_health_check_commands(target_node, api_key)
                      st.code(cmds, language="text")
-                     st.caption(f"※ {vendor} {os_type} 用のコマンドです")
