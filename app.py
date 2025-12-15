@@ -3,12 +3,12 @@ import graphviz
 import os
 import time
 import google.generativeai as genai
-from network_ops import run_diagnostic_simulation, generate_remediation_commands, predict_initial_symptoms
+import json
 
 # モジュール群のインポート
 from data import TOPOLOGY
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
-from network_ops import run_diagnostic_simulation, generate_remediation_commands
+from network_ops import run_diagnostic_simulation, generate_remediation_commands, predict_initial_symptoms, generate_fake_log_by_ai
 from verifier import verify_log_content, format_verification_report
 from dashboard import render_intelligent_alarm_viewer
 from bayes_engine import BayesianRCA
@@ -117,25 +117,16 @@ with st.sidebar:
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
 
-# --- セッション管理 (★ここを修正: 全変数を確実に初期化) ---
+# --- セッション管理 ---
 if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
 
-# 必須変数がなければ初期化 (AttributeError防止)
-if "live_result" not in st.session_state:
-    st.session_state.live_result = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "chat_session" not in st.session_state:
-    st.session_state.chat_session = None
-if "trigger_analysis" not in st.session_state:
-    st.session_state.trigger_analysis = False
-if "verification_result" not in st.session_state:
-    st.session_state.verification_result = None
-if "generated_report" not in st.session_state:
-    st.session_state.generated_report = None
+# 変数初期化
+for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log"]:
+    if key not in st.session_state:
+        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
 
-# シナリオ切り替え時のリセット処理
+# シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
     st.session_state.messages = []      
@@ -144,6 +135,7 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.trigger_analysis = False
     st.session_state.verification_result = None
     st.session_state.generated_report = None
+    st.session_state.verification_log = None # 復旧確認ログ
     if "remediation_plan" in st.session_state: del st.session_state.remediation_plan
     if "bayes_engine" in st.session_state: del st.session_state.bayes_engine
     st.rerun()
@@ -196,22 +188,16 @@ else:
             alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
             root_severity = "WARNING"
 
-# 2. ベイズエンジン初期化 & 初期証拠注入
+# 2. ベイズエンジン初期化 (AI自動推論)
 if "bayes_engine" not in st.session_state:
     st.session_state.bayes_engine = BayesianRCA(TOPOLOGY)
     
     if selected_scenario != "正常稼働" and api_key:
-        # ★ここが変更点: if分岐を廃止し、AIに症状を予測させる
-        # シナリオ名だけ渡せば、AIが「BGPならBGP Flappingだ」と判断してJSONを返す
         initial_symptoms = predict_initial_symptoms(selected_scenario, api_key)
-        
-        # AIが返した症状をベイズエンジンに注入
         if initial_symptoms.get("alarm"):
             st.session_state.bayes_engine.update_probabilities("alarm", initial_symptoms["alarm"])
-        
         if initial_symptoms.get("ping") == "NG":
             st.session_state.bayes_engine.update_probabilities("ping", "NG")
-            
         if initial_symptoms.get("log"):
             st.session_state.bayes_engine.update_probabilities("log", initial_symptoms["log"])
 
@@ -267,89 +253,91 @@ with col_map:
                     status.update(label="Diagnostics Failed", state="error")
             st.rerun()
 
-# === 右カラム: AI Analyst Report (詳細版) ===
-with col_chat:
-    st.subheader("📝 AI Analyst Report")
-    
-    # --- A. 状況報告 (Situation Report) ---
-    if selected_incident_candidate:
-        cand = selected_incident_candidate
-        
-        if "generated_report" not in st.session_state or st.session_state.generated_report is None:
-            if api_key and selected_scenario != "正常稼働":
-                with st.spinner("AI Analyst is writing a detailed report..."):
-                    target_conf = load_config_by_id(cand['id'])
-                    
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel("gemma-3-12b-it")
-                    
-                    prompt = f"""
-                    あなたはネットワーク運用監視のプロフェッショナルです。
-                    以下の障害インシデントについて、顧客向けの「詳細な状況報告レポート」を作成してください。
-                    
-                    【入力情報】
-                    - 発生シナリオ: {selected_scenario}
-                    - 根本原因候補: {cand['id']} ({cand['type']})
-                    - AI確信度: {cand['prob']:.1%}
-                    - 対象機器Config: 
-                    {target_conf[:1500]} (抜粋)
-
-                    【重要: 出力フォーマット要件】
-                    Markdown形式で出力しますが、**Streamlitで正しく表示させるため、各見出しと本文の間、およびセクション間には必ず「空行（改行）」を入れてください。**
-                    
-                    出力構成例:
-                    
-                    ### 状況報告：{cand['id']} ({cand['type']})
-                    
-                    **1. 障害概要**
-                    
-                    (ここに概要を記述...)
-                    
-                    **2. 影響**
-                    
-                    (ここに影響を記述...)
-                    
-                    **3. 詳細情報**
-                    
-                    - 機器名: ...
-                    - 障害内容: ...
-                    
-                    **4. 対応**
-                    
-                    (ここに対応を記述...)
-                    
-                    **5. 今後の対応**
-                    
-                    (ここに今後の対応を記述...)
-                    """
-                    
-                    try:
-                        resp = model.generate_content(prompt)
-                        st.session_state.generated_report = resp.text
-                    except Exception as e:
-                        st.session_state.generated_report = f"Report Generation Error: {e}"
-            else:
-                 st.session_state.generated_report = "監視中... 異常は検知されていません。"
-
-        if st.session_state.generated_report:
-            with st.container(border=True):
-                st.markdown(st.session_state.generated_report)
-    
-    # --- B. 診断実行結果 (Sanitized Logs) ---
+    # ★変更点: 診断結果をここ（左カラム・ボタンの下）に移動
     if st.session_state.live_result:
         res = st.session_state.live_result
         if res["status"] == "SUCCESS":
-            st.markdown("---")
-            st.subheader("🔍 Diagnostic Results")
-            with st.expander("📄 診断ログ出力 (🔒 Sanitized)", expanded=True):
+            st.markdown("#### 📄 Diagnostic Results")
+            with st.container(border=True):
+                # 自動検証結果
                 if st.session_state.verification_result:
                     v = st.session_state.verification_result
-                    st.caption(f"Verification: {v.get('hardware_status', 'N/A')} / {v.get('interface_status', 'N/A')}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Ping Status", v.get('ping_status'))
+                    c2.metric("Interface", v.get('interface_status'))
+                    c3.metric("Hardware", v.get('hardware_status'))
+                
+                st.divider()
+                # ログ出力
+                st.caption("🔒 Raw Logs (Sanitized)")
                 st.code(res["sanitized_log"], language="text")
         elif res["status"] == "ERROR":
             st.error(f"診断エラー: {res.get('error')}")
 
-    # --- C. 自動修復 & チャット ---
+# === 右カラム: 分析レポート ===
+with col_chat:
+    st.subheader("📝 AI Analyst Report")
+    
+    # --- A. 状況報告 (Situation Report) - ストリーミング対応 ---
+    if selected_incident_candidate:
+        cand = selected_incident_candidate
+        
+        # 1. まだレポートが未生成、かつシナリオが正常以外なら生成する
+        if "generated_report" not in st.session_state or st.session_state.generated_report is None:
+            if api_key and selected_scenario != "正常稼働":
+                
+                # コンテナを先に確保
+                report_container = st.empty()
+                
+                # Config情報の取得
+                target_conf = load_config_by_id(cand['id'])
+                
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel("gemma-3-12b-it")
+                
+                prompt = f"""
+                あなたはネットワーク運用監視のプロフェッショナルです。
+                以下の障害インシデントについて、顧客向けの「詳細な状況報告レポート」を作成してください。
+                
+                【入力情報】
+                - 発生シナリオ: {selected_scenario}
+                - 根本原因候補: {cand['id']} ({cand['type']})
+                - AI確信度: {cand['prob']:.1%}
+                - 対象機器Config: 
+                {target_conf[:1500]} (抜粋)
+
+                【出力フォーマット要件】
+                Markdown形式で出力します。
+                **重要**: 各見出し(### など)と本文の間、およびセクション間には必ず「空行」を入れて、Streamlitできれいに表示されるようにしてください。
+                
+                構成:
+                ### 状況報告：{cand['id']}
+                **1. 障害概要**
+                **2. 影響**
+                **3. 詳細情報** (機器名、HAグループ、障害内容、バージョン、設定情報など)
+                **4. 対応**
+                **5. 今後の対応**
+                """
+                
+                try:
+                    # ★変更点: ストリーミング実行 (stream=True)
+                    response = model.generate_content(prompt, stream=True)
+                    full_text = ""
+                    for chunk in response:
+                        full_text += chunk.text
+                        # リアルタイム表示
+                        report_container.markdown(full_text)
+                    st.session_state.generated_report = full_text
+                except Exception as e:
+                    st.session_state.generated_report = f"Report Generation Error: {e}"
+            else:
+                 st.session_state.generated_report = "監視中... 異常は検知されていません。"
+
+        # 生成済みレポートの表示（リロード時用）
+        elif st.session_state.generated_report:
+             st.markdown(st.session_state.generated_report)
+    
+    # --- B. 自動修復 & チャット ---
     st.markdown("---")
     st.subheader("🤖 Remediation & Chat")
 
@@ -373,22 +361,63 @@ with col_chat:
                 st.info("AI Generated Recovery Procedure")
                 st.markdown(st.session_state.remediation_plan)
             
+            # --- 復旧実行エリア ---
             col_exec1, col_exec2 = st.columns(2)
+            
             with col_exec1:
+                # ★変更点: 復旧実行後の検証ロジックを追加
                 if st.button("🚀 修復実行 (Execute)", type="primary"):
-                    with st.status("Applying Fix...", expanded=True):
-                        time.sleep(1)
-                        st.write("⚙️ Config pushed.")
-                        time.sleep(1)
-                    st.balloons()
-                    st.success("System Recovered.")
-                    if st.button("リセット"):
-                        del st.session_state.remediation_plan
-                        st.session_state.current_scenario = "正常稼働"
-                        st.rerun()
+                    if not api_key:
+                        st.error("API Key Required")
+                    else:
+                        with st.status("Autonomic Remediation in progress...", expanded=True) as status:
+                            st.write("⚙️ Applying Configuration...")
+                            time.sleep(1.5) # コマンド投入の演出
+                            
+                            st.write("🔎 Running Verification Commands...")
+                            # ここで「正常稼働」状態のログをAIに生成させて検証する
+                            target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
+                            # "正常稼働" というシナリオ名でログを作らせると、All OKなログが返るはず
+                            verification_log = generate_fake_log_by_ai("正常稼働", target_node_obj, api_key)
+                            st.session_state.verification_log = verification_log
+                            
+                            st.write("✅ Verification Completed.")
+                            status.update(label="Process Finished", state="complete", expanded=False)
+                        
+                        st.success("Remediation Process Finished. Please check the verification logs below.")
+
             with col_exec2:
                  if st.button("キャンセル"):
                     del st.session_state.remediation_plan
+                    st.session_state.verification_log = None
+                    st.rerun()
+            
+            # --- 検証結果の表示と手動確認 ---
+            if st.session_state.get("verification_log"):
+                st.markdown("#### 🔎 Post-Fix Verification Logs")
+                st.code(st.session_state.verification_log, language="text")
+                
+                # ログの内容に基づいて成功判定（簡易的）
+                is_success = "up" in st.session_state.verification_log.lower() or "ok" in st.session_state.verification_log.lower()
+                
+                if is_success:
+                    st.balloons()
+                    st.success("✅ System Recovered Successfully!")
+                else:
+                    st.warning("⚠️ Verification indicates potential issues. Please check manually.")
+
+                # 手動検証ボタン（念のため）
+                if st.button("🔄 手動検証 (Manual Verify)"):
+                    with st.spinner("Re-running verification..."):
+                        target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
+                        new_log = generate_fake_log_by_ai("正常稼働", target_node_obj, api_key)
+                        st.session_state.verification_log = new_log
+                        st.rerun()
+                        
+                if st.button("デモを終了してリセット"):
+                    del st.session_state.remediation_plan
+                    st.session_state.verification_log = None
+                    st.session_state.current_scenario = "正常稼働"
                     st.rerun()
 
     # チャット (常時表示)
@@ -407,9 +436,14 @@ with col_chat:
             if st.session_state.chat_session:
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
-                        res = st.session_state.chat_session.send_message(prompt)
-                        st.markdown(res.text)
-                        st.session_state.messages.append({"role": "assistant", "content": res.text})
+                        # チャットもストリーミングで応答
+                        res_container = st.empty()
+                        response = st.session_state.chat_session.send_message(prompt, stream=True)
+                        full_response = ""
+                        for chunk in response:
+                            full_response += chunk.text
+                            res_container.markdown(full_response)
+                        st.session_state.messages.append({"role": "assistant", "content": full_response})
 
 # ベイズ更新トリガー (診断後)
 if st.session_state.trigger_analysis and st.session_state.live_result:
