@@ -65,8 +65,8 @@ def render_topology(alarms, root_cause_candidates):
     alarm_map = {a.device_id: a for a in alarms}
     alarmed_ids = set(alarm_map.keys())
     
-    # AIが特定した根本原因IDのセット（スコア0.6以上）
-    root_cause_ids = {c['id'] for c in root_cause_candidates if c['prob'] > 0.6}
+    # AI判定結果のマッピング (ID -> Type)
+    node_status_map = {c['id']: c['type'] for c in root_cause_candidates}
     
     for node_id, node in TOPOLOGY.items():
         color = "#e8f5e9"
@@ -79,18 +79,21 @@ def render_topology(alarms, root_cause_candidates):
         vendor = node.metadata.get("vendor")
         if vendor: label += f"\n[{vendor}]"
 
-        # 色分けロジック
-        if node_id in root_cause_ids:
-            this_alarm = alarm_map.get(node_id)
-            if this_alarm and this_alarm.severity == "WARNING":
-                color = "#fff9c4" # Yellow
-            else:
-                color = "#ffcdd2" # Red
-            
+        # AI判定に基づく色分け
+        status_type = node_status_map.get(node_id, "Normal")
+        
+        if "Hardware/Physical" in status_type or "Critical" in status_type or "Silent" in status_type:
+            # 根本原因 (赤)
+            color = "#ffcdd2" 
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
-            
+        elif "Network/Unreachable" in status_type or "Network/Secondary" in status_type:
+            # 影響下/到達不能 (グレーまたは薄い赤)
+            color = "#cfd8dc" # Grayish
+            fontcolor = "#546e7a"
+            label += "\n[Unreachable]"
         elif node_id in alarmed_ids:
+            # アラームあり (黄)
             color = "#fff9c4" 
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
@@ -205,7 +208,6 @@ elif "同時多発" in selected_scenario:
     if ap_node: alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
     target_device_id = fw_node 
 else:
-    # 個別障害
     if "[WAN]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
     elif "[FW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
     elif "[L2SW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="SWITCH", layer=4)
@@ -242,31 +244,25 @@ with col2: st.metric("📨 処理アラーム数", f"{len(alarms) * 15 if alarms
 with col3: st.metric("🚨 要対応インシデント", f"{len([c for c in analysis_results if c['prob'] > 0.6])}件", "対処が必要")
 st.markdown("---")
 
-# --- データフレーム生成 (★修正箇所) ---
 df_data = []
-for rank, cand in enumerate(analysis_results[:5], 1):
-    # デフォルト
+# 表示件数を少し増やす（影響範囲を見るため）
+for rank, cand in enumerate(analysis_results[:8], 1):
     status = "⚪ 監視中"
     action = "👁️ 静観"
     
-    # 根本原因 (Root Cause)
     if cand['prob'] > 0.8:
         status = "🔴 危険 (根本原因)"
         action = "🚀 自動修復が可能"
-    # 被疑箇所 (Warning)
     elif cand['prob'] > 0.6:
         status = "🟡 警告 (被疑箇所)"
         action = "🔍 詳細調査を推奨"
     
-    # ★追加: 上位障害による波及 (Secondary)
-    if cand.get('type') == "Network/Secondary":
+    # ★追加: 上位障害による波及
+    if "Network/Unreachable" in cand['type'] or "Network/Secondary" in cand['type']:
         status = "⚫ 応答なし (上位障害)"
         action = "⛔ 対応不要 (上位復旧待ち)"
 
-    # 表示用テキストの整形
     candidate_text = f"デバイス: {cand['id']} / 原因: {cand['label']}"
-    
-    # ★追加: 能動的診断の実施有無を明記
     if cand.get('verification_log'):
         candidate_text += " [🔍 Active Probe: 応答なし]"
 
