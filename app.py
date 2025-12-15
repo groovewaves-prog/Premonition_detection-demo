@@ -184,13 +184,12 @@ elif "複合障害" in selected_scenario: # 電源+FAN
         ]
         root_severity = "CRITICAL"
 elif "同時多発" in selected_scenario: # FW + AP
-    # ★追加: 異なる設備での同時多発アラーム
     fw_node = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
     ap_node = find_target_node_id(TOPOLOGY, node_type="ACCESS_POINT")
     alarms = []
     if fw_node: alarms.append(Alarm(fw_node, "Heartbeat Loss", "WARNING"))
     if ap_node: alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
-    # 代表ターゲットは便宜上FWにする（マップ表示用）
+    # 代表ターゲットはFW（マップ表示用）
     target_device_id = fw_node
     root_severity = "CRITICAL"
 else:
@@ -314,18 +313,11 @@ with col_map:
 with col_chat:
     st.subheader("📝 AI Analyst Report")
     
-    # --- A. 状況報告 (Situation Report) ---
     if selected_incident_candidate:
         cand = selected_incident_candidate
         
-        # 前回と同じ候補IDなら再生成しない
-        should_generate = False
+        # --- A. 状況報告 (Situation Report) ---
         if "generated_report" not in st.session_state or st.session_state.generated_report is None:
-            should_generate = True
-        elif st.session_state.get("last_report_cand_id") != cand['id']:
-            should_generate = True
-            
-        if should_generate:
             st.info(f"インシデント選択中: **{cand['id']}** ({cand['type']})")
             
             if api_key and selected_scenario != "正常稼働":
@@ -344,7 +336,7 @@ with col_chat:
                     【入力情報】
                     - 発生シナリオ: {selected_scenario}
                     - 根本原因候補: {cand['id']} ({cand['type']})
-                    - AI確信度: {cand['prob']:.1%}
+                    - リスクスコア: {cand['prob']*100:.0f}
                     - 対象機器Config: 
                     {target_conf[:1500]} (抜粋)
 
@@ -385,7 +377,6 @@ with col_chat:
                                 report_container.markdown(full_text)
                         
                         if not full_text: full_text = "レポート生成に失敗しました（空の応答）。"
-                        
                         st.session_state.generated_report = full_text
                         st.session_state.last_report_cand_id = cand['id']
                         
@@ -403,7 +394,16 @@ with col_chat:
     st.markdown("---")
     st.subheader("🤖 Remediation & Chat")
 
+    # リスクスコア 0.6 (60%) 以上でボタンを表示
     if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
+        st.markdown(f"""
+        <div style="background-color:#e8f5e9;padding:10px;border-radius:5px;border:1px solid #4caf50;color:#2e7d32;margin-bottom:10px;">
+            <strong>✅ AI Analysis Completed</strong><br>
+            特定された原因 <b>{selected_incident_candidate['id']}</b> に対する復旧手順が利用可能です。<br>
+            (リスクスコア: <span style="font-size:1.2em;font-weight:bold;">{selected_incident_candidate['prob']*100:.0f}</span>)
+        </div>
+        """, unsafe_allow_html=True)
+
         if "remediation_plan" not in st.session_state:
             if st.button("✨ 修復プランを作成 (Generate Fix)"):
                  if not api_key: st.error("API Key Required")
@@ -469,7 +469,12 @@ with col_chat:
                     st.rerun()
     else:
         if selected_incident_candidate:
-            st.caption(f"自動修復ボタンは確信度が60%以上の時に表示されます (現在: {selected_incident_candidate['prob']:.1%})")
+            score = selected_incident_candidate['prob'] * 100
+            st.warning(f"""
+            ⚠️ **自動修復はロックされています**
+            現在選択されているインシデントのリスクスコアは **{score:.0f}** です。
+            誤操作防止のため、スコアが 60 以上の時のみ自動修復ボタンが有効化されます。
+            """)
 
     # チャット (常時表示)
     with st.expander("💬 Chat with AI Agent", expanded=False):
