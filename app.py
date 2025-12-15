@@ -3,16 +3,14 @@ import graphviz
 import os
 import time
 import google.generativeai as genai
-import json
 from google.api_core import exceptions as google_exceptions
 
 # モジュール群のインポート
 from data import TOPOLOGY
-from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
-from network_ops import run_diagnostic_simulation, generate_remediation_commands, predict_initial_symptoms, generate_fake_log_by_ai
-from verifier import verify_log_content, format_verification_report
+from logic import Alarm, simulate_cascade_failure
+from network_ops import run_diagnostic_simulation, generate_remediation_commands, generate_fake_log_by_ai
 from dashboard import render_intelligent_alarm_viewer
-from bayes_engine import BayesianRCA
+from inference_engine import LogicalRCA # ★変更: ベイズ廃止、論理エンジンへ
 
 # --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Autonomous", page_icon="⚡", layout="wide")
@@ -56,14 +54,17 @@ def generate_content_with_retry(model, prompt, stream=True, retries=3):
             time.sleep(2 * (i + 1))
     return None
 
-def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
-    """トポロジー図の描画"""
+def render_topology(alarms, root_cause_candidates):
+    """トポロジー図の描画 (AI判定結果を反映)"""
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
     graph.attr('node', shape='box', style='rounded,filled', fontname='Helvetica')
     
     alarm_map = {a.device_id: a for a in alarms}
     alarmed_ids = set(alarm_map.keys())
+    
+    # AIが特定した根本原因IDのセット（スコア0.6以上）
+    root_cause_ids = {c['id'] for c in root_cause_candidates if c['prob'] > 0.6}
     
     for node_id, node in TOPOLOGY.items():
         color = "#e8f5e9"
@@ -76,15 +77,21 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
         vendor = node.metadata.get("vendor")
         if vendor: label += f"\n[{vendor}]"
 
-        if root_cause_node and node_id == root_cause_node.id:
+        # 色分けロジック
+        if node_id in root_cause_ids:
+            # AIが根本原因と判定したノード
+            # アラームの重要度があればそれに従う、なければ赤
             this_alarm = alarm_map.get(node_id)
-            node_severity = this_alarm.severity if this_alarm else root_severity
-            if node_severity == "CRITICAL": color = "#ffcdd2"
-            elif node_severity == "WARNING": color = "#fff9c4"
-            else: color = "#e8f5e9"
+            if this_alarm and this_alarm.severity == "WARNING":
+                color = "#fff9c4" # Yellow
+            else:
+                color = "#ffcdd2" # Red
+            
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
+            
         elif node_id in alarmed_ids:
+            # アラームは出ているが根本原因ではない（連鎖など）
             color = "#fff9c4" 
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
@@ -133,9 +140,13 @@ if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
 
 # 変数初期化
-for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id"]:
+for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine"]:
     if key not in st.session_state:
         st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
+
+# エンジン初期化
+if not st.session_state.logic_engine:
+    st.session_state.logic_engine = LogicalRCA(TOPOLOGY)
 
 # シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
@@ -149,18 +160,16 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.verification_log = None 
     st.session_state.last_report_cand_id = None
     if "remediation_plan" in st.session_state: del st.session_state.remediation_plan
-    if "bayes_engine" in st.session_state: del st.session_state.bayes_engine
     st.rerun()
 
 # ==========================================
 # メインロジック
 # ==========================================
 alarms = []
-root_severity = "CRITICAL"
 target_device_id = None
 is_live_mode = False
 
-# 1. アラーム生成
+# 1. アラーム生成ロジック
 if "Live" in selected_scenario: is_live_mode = True
 elif "WAN全回線断" in selected_scenario:
     target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
@@ -169,7 +178,6 @@ elif "FW片系障害" in selected_scenario:
     target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
     if target_device_id:
         alarms = [Alarm(target_device_id, "Heartbeat Loss", "WARNING")]
-        root_severity = "WARNING"
 elif "L2SWサイレント障害" in selected_scenario:
     target_device_id = find_target_node_id(TOPOLOGY, node_type="SWITCH", layer=4)
     if target_device_id:
@@ -182,16 +190,13 @@ elif "複合障害" in selected_scenario: # 電源+FAN
             Alarm(target_device_id, "Power Supply 1 Failed", "CRITICAL"),
             Alarm(target_device_id, "Fan Fail", "WARNING")
         ]
-        root_severity = "CRITICAL"
 elif "同時多発" in selected_scenario: # FW + AP
     fw_node = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
     ap_node = find_target_node_id(TOPOLOGY, node_type="ACCESS_POINT")
     alarms = []
     if fw_node: alarms.append(Alarm(fw_node, "Heartbeat Loss", "WARNING"))
     if ap_node: alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
-    # 代表ターゲットはFW（マップ表示用）
-    target_device_id = fw_node
-    root_severity = "CRITICAL"
+    target_device_id = fw_node # 代表
 else:
     if "[WAN]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
     elif "[FW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
@@ -200,49 +205,91 @@ else:
     if target_device_id:
         if "電源障害：片系" in selected_scenario:
             alarms = [Alarm(target_device_id, "Power Supply 1 Failed", "WARNING")]
-            root_severity = "WARNING"
         elif "電源障害：両系" in selected_scenario:
             if "FW" in target_device_id:
                 alarms = [Alarm(target_device_id, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
             else:
                 alarms = simulate_cascade_failure(target_device_id, TOPOLOGY, "Power Supply: Dual Loss (Device Down)")
-            root_severity = "CRITICAL"
         elif "BGP" in selected_scenario:
             alarms = [Alarm(target_device_id, "BGP Flapping", "WARNING")]
-            root_severity = "WARNING"
         elif "FAN" in selected_scenario:
             alarms = [Alarm(target_device_id, "Fan Fail", "WARNING")]
-            root_severity = "WARNING"
         elif "メモリ" in selected_scenario:
             alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
-            root_severity = "WARNING"
 
-# 2. ベイズエンジン初期化
-if "bayes_engine" not in st.session_state:
-    st.session_state.bayes_engine = BayesianRCA(TOPOLOGY)
-    
-    if selected_scenario != "正常稼働" and api_key:
-        # 同時多発シナリオへの特別な証拠注入
-        if "同時多発" in selected_scenario:
-            st.session_state.bayes_engine.update_probabilities("alarm", "Heartbeat Loss")
-            st.session_state.bayes_engine.update_probabilities("alarm", "Connection Lost")
-        else:
-            initial_symptoms = predict_initial_symptoms(selected_scenario, api_key)
-            if initial_symptoms.get("alarm"):
-                st.session_state.bayes_engine.update_probabilities("alarm", initial_symptoms["alarm"])
-            if initial_symptoms.get("ping") == "NG":
-                st.session_state.bayes_engine.update_probabilities("ping", "NG")
-            if initial_symptoms.get("log"):
-                st.session_state.bayes_engine.update_probabilities("log", initial_symptoms["log"])
+# 2. 推論エンジンによる分析 (Deterministic Analysis)
+# ここでアラームを分析し、根本原因候補を算出する
+analysis_results = st.session_state.logic_engine.analyze(alarms)
 
 # 3. コックピット表示
 selected_incident_candidate = None
-if "bayes_engine" in st.session_state:
-    selected_incident_candidate = render_intelligent_alarm_viewer(
-        st.session_state.bayes_engine, 
-        selected_scenario,
-        alarms 
-    )
+# dashboard.py の関数には、ベイズエンジンではなく分析結果のリストを渡すように設計変更が必要だが
+# 今回は既存のインターフェースに合わせて、ダミーのget_rankingメソッドを持つオブジェクトを渡すか、
+# dashboard.py も修正する。今回は dashboard.py との整合性を保つため、
+# analyze結果をそのまま渡せるように dashboard.py 側を微調整するか、ここでアダプターを噛ませる。
+# 簡易的に、dashboard側で `bayes_engine.get_ranking()` を呼んでいる箇所を想定し、
+# ここでモックオブジェクトを作るのが早いが、正攻法で dashboard.py も修正するのが良い。
+# -> dashboard.pyの修正は今回はコード提示に含まれていないため、
+#    app.py内で dashboardの描画ロジックを吸収する（dashboard.py 依存を減らす）方針で実装します。
+
+# --- 簡易ダッシュボード表示 (app.py内に実装) ---
+st.markdown("### 🛡️ AIOps インシデント・コックピット")
+col1, col2, col3 = st.columns(3)
+with col1: st.metric("📉 ノイズ削減率", "98.5%", "高効率稼働中")
+with col2: st.metric("📨 処理アラーム数", f"{len(alarms) * 15 if alarms else 0}件", "抑制済")
+with col3: st.metric("🚨 要対応インシデント", f"{len([c for c in analysis_results if c['prob'] > 0.6])}件", "対処が必要")
+st.markdown("---")
+
+# データフレーム表示
+import pandas as pd
+df_data = []
+for rank, cand in enumerate(analysis_results[:5], 1):
+    status = "⚪ 監視中"
+    action = "👁️ 静観"
+    if cand['prob'] > 0.8:
+        status = "🔴 危険 (根本原因)"
+        action = "🚀 自動修復が可能"
+    elif cand['prob'] > 0.6:
+        status = "🟡 警告 (被疑箇所)"
+        action = "🔍 詳細調査を推奨"
+    
+    df_data.append({
+        "順位": rank,
+        "ステータス": status,
+        "根本原因候補": f"デバイス: {cand['id']} / 原因: {cand['label']}",
+        "リスクスコア": cand['prob'],
+        "推奨アクション": action,
+        "ID": cand['id'],
+        "Type": cand['type']
+    })
+
+df = pd.DataFrame(df_data)
+st.info("💡 ヒント: インシデントの行をクリックすると、右側に詳細分析と復旧プランが表示されます。")
+
+event = st.dataframe(
+    df,
+    column_order=["順位", "ステータス", "根本原因候補", "リスクスコア", "推奨アクション"],
+    column_config={
+        "リスクスコア": st.column_config.ProgressColumn("リスクスコア (0-1.0)", format="%.2f", min_value=0, max_value=1),
+    },
+    use_container_width=True,
+    hide_index=True,
+    selection_mode="single-row",
+    on_select="rerun"
+)
+
+# 選択処理
+if len(event.selection.rows) > 0:
+    idx = event.selection.rows[0]
+    sel_row = df.iloc[idx]
+    # analysis_resultsから該当データを検索
+    for res in analysis_results:
+        if res['id'] == sel_row['ID'] and res['type'] == sel_row['Type']:
+            selected_incident_candidate = res
+            break
+else:
+    selected_incident_candidate = analysis_results[0] if analysis_results else None
+
 
 # 4. 画面分割
 col_map, col_chat = st.columns([1.2, 1])
@@ -254,14 +301,21 @@ with col_map:
     current_root_node = None
     current_severity = "WARNING"
     
+    # 選択中のインシデントがあれば、それをルートとして表示
     if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
         current_root_node = TOPOLOGY.get(selected_incident_candidate["id"])
-        current_severity = "CRITICAL"
+        
+        # 色決定ロジック
+        if "Hardware/Physical" in selected_incident_candidate["type"] or "Critical" in selected_incident_candidate["type"]:
+            current_severity = "CRITICAL"
+        else:
+            current_severity = "WARNING"
+
     elif target_device_id:
         current_root_node = TOPOLOGY.get(target_device_id)
         current_severity = root_severity
 
-    st.graphviz_chart(render_topology(alarms, current_root_node, current_severity), use_container_width=True)
+    st.graphviz_chart(render_topology(alarms, analysis_results), use_container_width=True)
 
     st.markdown("---")
     st.subheader("🛠️ Auto-Diagnostics")
@@ -318,7 +372,7 @@ with col_chat:
         
         # --- A. 状況報告 (Situation Report) ---
         if "generated_report" not in st.session_state or st.session_state.generated_report is None:
-            st.info(f"インシデント選択中: **{cand['id']}** ({cand['type']})")
+            st.info(f"インシデント選択中: **{cand['id']}** ({cand['label']})")
             
             if api_key and selected_scenario != "正常稼働":
                 if st.button("📝 詳細レポートを作成 (Generate Report)"):
@@ -335,7 +389,7 @@ with col_chat:
                     
                     【入力情報】
                     - 発生シナリオ: {selected_scenario}
-                    - 根本原因候補: {cand['id']} ({cand['type']})
+                    - 根本原因候補: {cand['id']} ({cand['label']})
                     - リスクスコア: {cand['prob']*100:.0f}
                     - 対象機器Config: 
                     {target_conf[:1500]} (抜粋)
@@ -394,7 +448,7 @@ with col_chat:
     st.markdown("---")
     st.subheader("🤖 Remediation & Chat")
 
-    # リスクスコア 0.6 (60%) 以上でボタンを表示
+    # 論理エンジンで高スコアならボタン表示
     if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
         st.markdown(f"""
         <div style="background-color:#e8f5e9;padding:10px;border-radius:5px;border:1px solid #4caf50;color:#2e7d32;margin-bottom:10px;">
@@ -412,7 +466,7 @@ with col_chat:
                         t_node = TOPOLOGY.get(selected_incident_candidate["id"])
                         plan_md = generate_remediation_commands(
                             selected_scenario, 
-                            f"Identified Root Cause: {selected_incident_candidate['type']}", 
+                            f"Identified Root Cause: {selected_incident_candidate['label']}", 
                             t_node, api_key
                         )
                         st.session_state.remediation_plan = plan_md
@@ -502,14 +556,3 @@ with col_chat:
                             st.session_state.messages.append({"role": "assistant", "content": full_response})
                         else:
                             st.error("AIからの応答がありませんでした。")
-
-# ベイズ更新トリガー (診断後)
-if st.session_state.trigger_analysis and st.session_state.live_result:
-    if st.session_state.verification_result:
-        v_res = st.session_state.verification_result
-        if "NG" in v_res.get("ping_status", ""):
-                st.session_state.bayes_engine.update_probabilities("ping", "NG")
-        if "DOWN" in v_res.get("interface_status", ""):
-                st.session_state.bayes_engine.update_probabilities("log", "Interface Down")
-    st.session_state.trigger_analysis = False
-    st.rerun()
