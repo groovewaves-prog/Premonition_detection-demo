@@ -8,7 +8,11 @@
       "redundancy_type": "PSU",
       "vendor": "Cisco",
       "os": "IOS-XE",
-      "model": "ISR 4451-X"
+      "model": "ISR 4451-X",
+      "hw_inventory": {
+        "psu_count": 2,
+        "fan_count": 3
+      }
     }
   },
   "FW_01_PRIMARY": {
@@ -21,7 +25,10 @@
       "role": "Active",
       "vendor": "Juniper",
       "os": "Junos OS",
-      "model": "SRX300"
+      "model": "SRX300",
+      "hw_inventory": {
+        "psu_count": 2
+      }
     }
   },
   "FW_01_SECONDARY": {
@@ -34,7 +41,10 @@
       "role": "Standby",
       "vendor": "Juniper",
       "os": "Junos OS",
-      "model": "SRX300"
+      "model": "SRX300",
+      "hw_inventory": {
+        "psu_count": 2
+      }
     }
   },
   "CORE_SW_01": {
@@ -46,7 +56,10 @@
       "redundancy_type": "PSU",
       "vendor": "Cisco",
       "os": "IOS-XE",
-      "model": "Catalyst 9300"
+      "model": "Catalyst 9300",
+      "hw_inventory": {
+        "psu_count": 2
+      }
     }
   },
   "L2_SW_01": {
