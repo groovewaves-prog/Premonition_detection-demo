@@ -135,11 +135,6 @@ class LogicalRCA:
     def analyze(self, alarms: List) -> List[Dict[str, Any]]:
         """
         アラームリストを分析して根本原因候補を返す（辞書形式）
-
-        改善ポイント:
-          1) 同一デバイスの複数アラームを“まとめて”判断
-          2) 親が落ちているときの子の Unreachable を根本原因扱いしない
-          3) “冗長OKなら黄色、停止なら赤” をローカル安全ルールで確定
         """
         if not alarms:
             return [{
@@ -151,7 +146,6 @@ class LogicalRCA:
                 "reason": "No active alerts detected."
             }]
 
-        # device_id -> [messages...]
         msg_map: Dict[str, List[str]] = {}
         for a in alarms:
             msg_map.setdefault(a.device_id, []).append(a.message)
@@ -164,9 +158,7 @@ class LogicalRCA:
 
         results: List[Dict[str, Any]] = []
 
-        # デバイス単位で判断（まとめて渡す）
         for device_id, messages in msg_map.items():
-            # 1) カスケード抑制（親もアラーム中のときの子の Unreachable）
             if any("Unreachable" in m for m in messages) and parent_is_alarmed(device_id):
                 p = self._get_parent_id(device_id)
                 results.append({
@@ -179,10 +171,8 @@ class LogicalRCA:
                 })
                 continue
 
-            # 2) 冗長性/停止の判定（ローカル安全ルール→必要ならLLM）
             analysis = self.analyze_redundancy_depth(device_id, messages)
 
-            # 3) 確信度マッピング
             if analysis.get("impact_type") == "UNKNOWN" and "API key not configured" in analysis.get("reason", ""):
                 prob = 0.5
                 tier = 3
@@ -234,7 +224,6 @@ class LogicalRCA:
         safe_alerts = [self._sanitize_text(a) for a in alerts]
         joined = " ".join(safe_alerts)
 
-        # (A) ローカル安全ルール：停止（赤）確定
         if ("Dual Loss" in joined) or ("Device Down" in joined) or ("Thermal Shutdown" in joined):
             return {
                 "status": HealthStatus.CRITICAL,
@@ -242,7 +231,6 @@ class LogicalRCA:
                 "impact_type": "Hardware/Physical"
             }
 
-        # (B) ローカル安全ルール：PSU片系（黄色/赤）
         psu_count = self._get_psu_count(device_id, default=1)
         psu_single_fail = (
             ("Power Supply" in joined and "Failed" in joined and "Dual" not in joined)
@@ -261,7 +249,6 @@ class LogicalRCA:
                 "impact_type": "Hardware/Physical"
             }
 
-        # (C) LLMに委譲（APIキーがある場合）
         if not self._ensure_api_configured():
             return {
                 "status": HealthStatus.WARNING,
@@ -292,21 +279,13 @@ class LogicalRCA:
 - “冗長が効いている（サービス継続）”と判断できる限り、CRITICALにしないこと。
 - 逆に、サービス断（停止）が強く示唆される場合のみ CRITICAL にすること。
 
-（参考例）
-1) 電源(PSU)
-  - PSU冗長がある可能性が高く、片系のみFail → WARNING（片系運転）
-  - 両系Fail、または device down → CRITICAL
-2) インターフェース/LAG
-  - Downしている物理IFが LAG のメンバーで、親LAGがUp → WARNING（帯域縮退）
-  - 親LAG自体のDown、または非LAGの重要ポートDown → CRITICAL
-
 ### 出力フォーマット
 以下のJSON形式のみを出力してください（Markdownコードブロックは不要）。
-{
+{{
   "status": "NORMAL|WARNING|CRITICAL",
   "reason": "判定理由を簡潔に記述",
   "impact_type": "NONE|DEGRADED|REDUNDANCY_LOST|OUTAGE|UNKNOWN"
-}
+}}
 """
 
         try:
