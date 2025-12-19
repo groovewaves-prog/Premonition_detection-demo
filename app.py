@@ -353,9 +353,9 @@ for key in ["live_result", "messages", "chat_session", "trigger_analysis", "veri
 
 
 # 復旧状態（デモ用）
-if st.session_state.recovered_devices is None:
+if "recovered_devices" not in st.session_state:
     st.session_state.recovered_devices = {}
-if st.session_state.recovered_scenario_map is None:
+if "recovered_scenario_map" not in st.session_state:
     st.session_state.recovered_scenario_map = {}
 
 # エンジン初期化
@@ -365,6 +365,9 @@ if not st.session_state.logic_engine:
 # シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
+    # シナリオ変更時は復旧フラグもクリア（未修復なのにOKになるのを防ぐ）
+    st.session_state.recovered_devices = {}
+    st.session_state.recovered_scenario_map = {}
     st.session_state.messages = []      
     st.session_state.chat_session = None 
     st.session_state.live_result = None 
