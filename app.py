@@ -58,6 +58,91 @@ def generate_content_with_retry(model, prompt, stream=True, retries=3):
     return None
 
 
+def _pick_first(mapping: dict, keys: list[str], default: str = "") -> str:
+    """Return the first non-empty value for the given keys from mapping (stringify scalars)."""
+    for k in keys:
+        try:
+            v = mapping.get(k, None)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        if isinstance(v, (int, float, bool)):
+            s = str(v)
+            if s:
+                return s
+        elif isinstance(v, str):
+            if v.strip():
+                return v.strip()
+        else:
+            # for non-string, try json
+            try:
+                s = json.dumps(v, ensure_ascii=False)
+                if s and s != "null":
+                    return s
+            except Exception:
+                continue
+    return default
+
+
+def _build_ci_context_for_chat(target_node_id: str) -> dict:
+    """チャット用のCIコンテキストを最小限で構築します（CI/Configをフル活用、キー揺れを吸収）。"""
+    node = TOPOLOGY.get(target_node_id) if target_node_id else None
+    md = (getattr(node, "metadata", None) or {}) if node else {}
+
+    ci = {
+        "device_id": target_node_id or "",
+        "hostname": _pick_first(md, ["hostname", "host", "name"], default=(target_node_id or "")),
+        "vendor": _pick_first(md, ["vendor", "manufacturer", "maker", "brand"], default=""),
+        "os": _pick_first(md, ["os", "platform", "os_name", "software", "sw"], default=""),
+        "model": _pick_first(md, ["model", "hw_model", "product", "sku"], default=""),
+        "role": _pick_first(md, ["role", "type", "device_role"], default=""),
+        "layer": _pick_first(md, ["layer", "level", "network_layer"], default=""),
+        "site": _pick_first(md, ["site", "dc", "datacenter", "location"], default=""),
+        "tenant": _pick_first(md, ["tenant", "customer", "org", "company"], default=""),
+        "mgmt_ip": _pick_first(md, ["mgmt_ip", "management_ip", "management", "oob_ip"], default=""),
+        "interfaces": md.get("interfaces", ""),
+    }
+
+    # Config は長いので抜粋（存在すれば最大1500文字）
+    try:
+        conf = load_config_by_id(target_node_id) if target_node_id else ""
+        if conf:
+            ci["config_excerpt"] = conf[:1500]
+    except Exception:
+        pass
+
+    return ci
+
+
+def _safe_chunk_text(chunk) -> str:
+    """google.generativeai の stream chunk から安全にテキストを取り出します。"""
+    # chunk.text は ValueError になり得る
+    try:
+        t = getattr(chunk, "text", "")
+        if t:
+            return t
+    except Exception:
+        pass
+
+    # candidates -> content -> parts から拾う
+    try:
+        cands = getattr(chunk, "candidates", None) or []
+        if not cands:
+            return ""
+        content = getattr(cands[0], "content", None)
+        parts = getattr(content, "parts", None) or []
+        out = []
+        for p in parts:
+            tx = getattr(p, "text", "")
+            if tx:
+                out.append(tx)
+        return "".join(out)
+    except Exception:
+        return ""
+
+
+
 
 def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
     """LLMを呼ばない疑似診断（503/コスト対策）。UXは維持しつつ、材料を増やすためのログを生成します。
@@ -709,6 +794,41 @@ with col_chat:
 
     # チャット (常時表示)
     with st.expander("💬 Chat with AI Agent", expanded=False):
+        # 対象CIのサマリ（表示のみ、UXは崩さず最小）
+        _chat_target_id = ""
+        try:
+            if selected_incident_candidate:
+                _chat_target_id = selected_incident_candidate.get("id", "") or ""
+        except Exception:
+            _chat_target_id = ""
+        if not _chat_target_id:
+            _chat_target_id = target_device_id if 'target_device_id' in globals() else ""
+        _chat_ci = _build_ci_context_for_chat(_chat_target_id) if _chat_target_id else {}
+        if _chat_ci:
+            _vendor = _chat_ci.get("vendor", "") or "Unknown"
+            _os = _chat_ci.get("os", "") or "Unknown"
+            _model = _chat_ci.get("model", "") or "Unknown"
+            st.caption(f"対象機器: {_chat_target_id}   Vendor: {_vendor}   OS: {_os}   Model: {_model}")
+
+        # クイック質問（入力欄は変えず、コピペ用に提示）
+        q1, q2, q3 = st.columns(3)
+        if "chat_quick_text" not in st.session_state:
+            st.session_state.chat_quick_text = ""
+
+        with q1:
+            if st.button("設定バックアップ", use_container_width=True):
+                st.session_state.chat_quick_text = "この機器で、現在の設定を安全にバックアップする手順とコマンド例を教えてください。"
+        with q2:
+            if st.button("ロールバック", use_container_width=True):
+                st.session_state.chat_quick_text = "この機器で、変更をロールバックする代表的な手順（候補）と注意点を教えてください。"
+        with q3:
+            if st.button("確認コマンド", use_container_width=True):
+                st.session_state.chat_quick_text = "今回の症状を切り分けるために、まず実行すべき確認コマンド（show/diagnostic）を優先度順に教えてください。"
+
+        if st.session_state.chat_quick_text:
+            st.info("クイック質問（コピーして貼り付け）")
+            st.code(st.session_state.chat_quick_text)
+
         if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemma-3-12b-it")
@@ -724,12 +844,45 @@ with col_chat:
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         res_container = st.empty()
-                        response = generate_content_with_retry(st.session_state.chat_session.model, prompt, stream=True)
+                        # CI-aware prompt（CI/Config をフル活用）
+                        target_id = ""
+                        try:
+                            if selected_incident_candidate:
+                                target_id = selected_incident_candidate.get("id", "") or ""
+                        except Exception:
+                            target_id = ""
+                        if not target_id:
+                            try:
+                                target_id = target_device_id
+                            except Exception:
+                                target_id = ""
+                        ci = _build_ci_context_for_chat(target_id) if target_id else {}
+                        ci_prompt = f"""あなたはネットワーク運用（NOC/SRE）の実務者です。
+次の CI 情報と Config 抜粋を必ず参照して、具体的に回答してください。一般論だけで終わらせないでください。
+
+【CI (JSON)】
+{json.dumps(ci, ensure_ascii=False, indent=2)}
+
+【ユーザーの質問】
+{prompt}
+
+回答ルール:
+- CI/Config に基づく具体手順・コマンド例を提示する
+- 追加確認が必要なら、質問は最小限（1〜2点）に絞る
+- 不明な前提は推測せず「CIに無いので確認が必要」と明記する
+"""
+
+                        response = generate_content_with_retry(st.session_state.chat_session.model, ci_prompt, stream=True)
                         if response:
                             full_response = ""
                             for chunk in response:
-                                full_response += chunk.text
+                                piece = _safe_chunk_text(chunk)
+                                if not piece:
+                                    continue
+                                full_response += piece
                                 res_container.markdown(full_response)
+                            if not full_response.strip():
+                                full_response = "AI応答が空でした（CIは渡しましたが出力が生成されませんでした）。"
                             st.session_state.messages.append({"role": "assistant", "content": full_response})
                         else:
                             st.error("AIからの応答がありませんでした。")
