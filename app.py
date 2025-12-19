@@ -8,6 +8,33 @@ import re
 import pandas as pd
 from google.api_core import exceptions as google_exceptions
 
+MODEL_NAME = "models/gemma-3-12b-it"
+DEFAULT_GEN_CONFIG = {
+    "temperature": 0.2,
+    "max_output_tokens": 2048,
+}
+
+def _get_gemini_api_key() -> str:
+    # Streamlit Cloud secrets優先 → 環境変数
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+
+def _init_gemini_model():
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        return None, ""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        generation_config=DEFAULT_GEN_CONFIG,
+    )
+    return model, api_key
+
+
 # モジュール群のインポート
 from data import TOPOLOGY
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
@@ -317,11 +344,8 @@ def render_topology(alarms, root_cause_candidates):
 # --- UI構築 ---
 st.title("⚡ Antigravity Autonomous Agent")
 
-api_key = None
-if "GOOGLE_API_KEY" in st.secrets:
-    api_key = st.secrets["GOOGLE_API_KEY"]
-else:
-    api_key = os.environ.get("GOOGLE_API_KEY")
+# LLM (Gemini / Gemma) 初期化
+_llm_model, api_key = _init_gemini_model()
 
 # --- サイドバー ---
 with st.sidebar:
@@ -339,8 +363,10 @@ with st.sidebar:
     if api_key: st.success("API Connected")
     else:
         st.warning("API Key Missing")
-        user_key = st.text_input("Google API Key", type="password")
-        if user_key: api_key = user_key
+        user_key = st.text_input("Gemini API Key", type="password")
+        if user_key:
+            os.environ["GEMINI_API_KEY"] = user_key
+            _llm_model, api_key = _init_gemini_model()
 
 # --- セッション管理 ---
 if "current_scenario" not in st.session_state:
@@ -613,8 +639,7 @@ with col_chat:
                     report_container = st.empty()
                     target_conf = load_config_by_id(cand['id'])
                     
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel("gemma-3-12b-it")
+                    model = _llm_model
 
                     verification_context = cand.get("verification_log", "特になし")
                     target_conf = load_config_by_id(cand['id'])
@@ -867,8 +892,7 @@ with st.sidebar:
             if 'chat_session' not in st.session_state:
                 api_key = os.environ.get("GEMINI_API_KEY", "")
                 if api_key:
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel("gemma-3-12b-it")
+                    model = _llm_model
                     st.session_state.chat_session = model.start_chat(history=[])
                 else:
                     st.session_state.chat_session = None
