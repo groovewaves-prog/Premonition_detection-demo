@@ -123,6 +123,42 @@ def generate_health_check_commands(target_node, api_key):
     except Exception as e:
         return f"Command Gen Error: {e}"
 
+def generate_analyst_report(scenario, target_node, topology_context, target_conf, verification_context, api_key):
+    """
+    原因分析専用レポート生成
+    """
+    if not api_key: return "Error: API Key Missing"
+    
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+    
+    vendor = target_node.metadata.get("vendor", "Unknown")
+    os_type = target_node.metadata.get("os", "Unknown OS")
+    
+    prompt = f"""
+    ネットワーク障害の原因分析レポートを生成してください。
+    
+    シナリオ: {scenario}
+    デバイス: {target_node.id}
+    ベンダー: {vendor}
+    OS: {os_type}
+    
+    出力: Markdown形式で、以下セクションで構成
+    - 障害概要
+    - 発生原因
+    - 影響範囲
+    - 技術的根拠
+    - 切り分け判断の理由
+    
+    ★重要: 復旧コマンドやロールバック手順は含めないでください。
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error: {e}"
+
 def generate_remediation_commands(scenario, analysis_result, target_node, api_key):
     """
     障害シナリオと分析結果に基づき、復旧手順（物理対応＋コマンド＋確認）を生成する
