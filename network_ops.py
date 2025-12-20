@@ -1,14 +1,10 @@
 """
 Google Antigravity AIOps Agent - Network Operations Module
-改善案C（非同期処理）対応版
 """
 import re
 import os
 import time
 import json
-import concurrent.futures
-from typing import Dict, List
-from enum import Enum
 import google.generativeai as genai
 from netmiko import ConnectHandler
 
@@ -39,20 +35,26 @@ def sanitize_output(text: str) -> str:
 def generate_fake_log_by_ai(scenario_name, target_node, api_key):
     """
     シナリオ名と機器メタデータから、AIが自律的に障害ログを生成する
+    （ルールベースの分岐を廃止）
     """
     if not api_key: return "Error: API Key Missing"
     
     genai.configure(api_key=api_key)
+    # 推論能力が高いモデルを使用
     model = genai.GenerativeModel(
         "gemma-3-12b-it",
-        generation_config={"temperature": 0.2}
+        generation_config={"temperature": 0.2} # 多少の創造性を持たせるため0.0から少し上げる
     )
     
+    # ノード情報（JSONから取得）
     vendor = target_node.metadata.get("vendor", "Generic")
     os_type = target_node.metadata.get("os", "Generic OS")
     model_name = target_node.metadata.get("model", "Generic Device")
     hostname = target_node.id
 
+    # プロンプト：AIへの指示書
+    # 具体的な「電源ならこうしろ」という指示を削除し、
+    # 「シナリオ名を解釈して、それっぽいログを作れ」というメタな指示に変更
     prompt = f"""
     あなたはネットワーク機器のCLIシミュレーター（熟練エンジニアのロールプレイング）です。
     ユーザーが指定した「障害シナリオ」に基づいて、トラブルシューティング時に実行されるであろう
@@ -66,14 +68,17 @@ def generate_fake_log_by_ai(scenario_name, target_node, api_key):
     - **発生している障害シナリオ**: 「{scenario_name}」
 
     【AIへの指示】
-    1. **シナリオの解釈**: 提供されたシナリオ名から、技術的にどのような状態であるべきか推測してください。
-    2. **コマンド選択**: その障害を確認するために、このベンダー({vendor})でよく使われる確認コマンドを2〜3個選んでください。
+    1. **シナリオの解釈**: 提供されたシナリオ名（例: "電源障害", "BGP Flapping", "Cable Cut"など）から、技術的にどのような状態であるべきか推測してください。
+    2. **コマンド選択**: その障害を確認するために、このベンダー({vendor})でよく使われる確認コマンドを2〜3個選んでください。（例: show environment, show log, show ip bgp sum, show interface 等）
     3. **ログ生成**: 選んだコマンドに対し、シナリオ通りの異常状態を示す出力を生成してください。
+       - 電源障害なら: Power Supply Status を Faulty/Failed にする。
+       - インターフェース障害なら: Protocol Down にする。
+       - 正常稼働なら: 全て OK/Up にする。
     4. **リアリティ**: タイムスタンプやプロンプトを含め、本物のCLI画面のように出力してください。
 
     【出力形式】
     解説不要。CLIのテキストデータのみを出力してください。
-    Markdownのコードブロックは使用しないでください。
+    Markdownのコードブロックは使用しないでください（生テキストで出力）。
     """
     
     try:
@@ -118,6 +123,47 @@ def generate_health_check_commands(target_node, api_key):
     except Exception as e:
         return f"Command Gen Error: {e}"
 
+def generate_remediation_commands(scenario, analysis_result, target_node, api_key):
+    """
+    障害シナリオと分析結果に基づき、復旧手順（物理対応＋コマンド＋確認）を生成する
+    """
+    if not api_key: return "Error: API Key Missing"
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+    
+    prompt = f"""
+    あなたは熟練したネットワークエンジニアです。
+    発生している障害に対して、オペレーターが実行すべき**「完全な復旧手順書」**を作成してください。
+    
+    対象デバイス: {target_node.id} ({target_node.metadata.get('vendor')} {target_node.metadata.get('os')})
+    発生シナリオ: {scenario}
+    AI分析結果: {analysis_result}
+    
+    【重要: 出力要件】
+    以下の3つのセクションを必ず含めてください。Markdown形式で出力すること。
+
+    ### 1. 物理・前提アクション (Physical Actions)
+    * 電源障害やケーブル断、FAN故障の場合、「交換手順」や「結線確認」を具体的に指示してください。
+    * 例：「故障した電源ユニット(PSU1)を交換してください」「LANケーブルを再結線してください」など。
+    * ソフトウェア設定のみで直る場合は「特になし」で構いません。
+
+    ### 2. 復旧コマンド (Recovery Config)
+    * 設定変更や再起動が必要な場合のコマンド。
+    * 物理交換だけで復旧する場合でも、念のためのインターフェースリセット手順などを記載してください。
+    * コマンドは Markdownのコードブロック(```) で囲んでください。
+
+    ### 3. 正常性確認コマンド (Verification Commands)
+    * 対応後に正常に戻ったかを確認するためのコマンド（showコマンドやpingなど）。
+    * 必ず3つ以上提示してください。
+    * コマンドは Markdownのコードブロック(```) で囲んでください。
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Remediation Gen Error: {e}"
+
 def run_diagnostic_simulation(scenario_type, target_node=None, api_key=None):
     time.sleep(1.5)
     
@@ -148,46 +194,13 @@ def run_diagnostic_simulation(scenario_type, target_node=None, api_key=None):
         else:
             return {"status": "ERROR", "sanitized_log": "", "error": "API Key or Target Node Missing"}
 
-def predict_initial_symptoms(scenario_name, api_key):
-    """
-    障害シナリオ名から、発生しうる「初期症状」を推論
-    """
-    if not api_key: return {}
-    
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
-    
-    prompt = f"""
-    あなたはネットワーク監視システムのAIエージェントです。
-    指定された「障害シナリオ」において、監視システムが最初に検知するであろう「初期症状」を推論してください。
-
-    **シナリオ**: {scenario_name}
-
-    【出力要件】
-    1. 以下のキーを持つ **JSON形式** で出力すること。解説は不要。
-       - "alarm": アラームメッセージ
-       - "ping": 疎通状態
-       - "log": ログキーワード
-    
-    2. 値は適切なものを選んでください。
-
-    **例**:
-    シナリオ: "[WAN] BGPルートフラッピング"
-    出力: {{ "alarm": "BGP Flapping", "ping": "OK", "log": "" }}
-    """
-    
-    try:
-        response = model.generate_content(prompt)
-        text = response.text
-        text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-    except Exception as e:
-        print(f"Symptom Prediction Error: {e}")
-        return {}
-
 # =====================================================
 # 【新規】改善案C：非同期修復プロセス
 # =====================================================
+
+import concurrent.futures
+from typing import Dict
+from enum import Enum
 
 class RemediationEnvironment(Enum):
     """実行環境"""
@@ -232,16 +245,6 @@ def run_remediation_parallel_v2(
 ) -> Dict[str, RemediationResult]:
     """
     複数の修復ステップを並列実行（実運用対応版）
-    
-    Args:
-        device_id: デバイスID
-        device_info: デバイス情報
-        scenario: 障害シナリオ
-        environment: 実行環境（DEMO/TEST/PROD）
-        timeout_per_step: 各ステップのタイムアウト時間（秒）
-    
-    Returns:
-        dict: {step_name: RemediationResult}
     """
     
     def backup_step():
@@ -292,44 +295,27 @@ def _remediation_backup(
     """Step 1: バックアップ取得"""
     try:
         if environment == RemediationEnvironment.DEMO:
-            # デモ: モック実装
             time.sleep(2)
-            backup_content = f"""
-! Configuration Backup for {device_id}
-! {time.strftime('%Y-%m-%d %H:%M:%S')}
-interface GigabitEthernet0/0/0
- ip address 203.0.113.1 255.255.255.0
- no shutdown
-!
-router bgp 65000
- bgp router-id 192.168.1.1
- neighbor 203.0.113.2 remote-as 64000
-!
-"""
+            backup_content = f"! Config Backup {device_id}"
             return RemediationResult(
                 step_name="Backup",
                 status="success",
                 data=f"Backup created ({len(backup_content)} bytes)"
             )
-        
         elif environment == RemediationEnvironment.TEST:
-            # テスト: 実際のコマンド実行（将来実装）
             time.sleep(2)
             return RemediationResult(
                 step_name="Backup",
                 status="success",
-                data="Backup saved (test environment)"
+                data="Backup saved (test)"
             )
-        
-        else:  # PRODUCTION
-            # 本番: セキュア実装（将来実装）
+        else:
             time.sleep(2)
             return RemediationResult(
                 step_name="Backup",
                 status="success",
-                data="Backup saved securely (production)"
+                data="Backup saved (production)"
             )
-    
     except Exception as e:
         return RemediationResult(
             step_name="Backup",
@@ -349,32 +335,26 @@ def _remediation_apply(
         fix_commands = _get_fix_commands_for_scenario(device_id, scenario)
         
         if environment == RemediationEnvironment.DEMO:
-            # デモ: モック実装
             time.sleep(3)
             return RemediationResult(
                 step_name="Apply",
                 status="success",
-                data=f"Applied {len(fix_commands)} configuration commands"
+                data=f"Applied {len(fix_commands)} commands"
             )
-        
         elif environment == RemediationEnvironment.TEST:
-            # テスト: 実装予定
             time.sleep(3)
             return RemediationResult(
                 step_name="Apply",
                 status="success",
                 data=f"Applied {len(fix_commands)} commands (test)"
             )
-        
-        else:  # PRODUCTION
-            # 本番: 実装予定
+        else:
             time.sleep(3)
             return RemediationResult(
                 step_name="Apply",
                 status="success",
                 data=f"Applied {len(fix_commands)} commands (production)"
             )
-    
     except Exception as e:
         return RemediationResult(
             step_name="Apply",
@@ -391,14 +371,10 @@ def _remediation_verify(
     """Step 3: 正常性を確認"""
     try:
         if environment == RemediationEnvironment.DEMO:
-            # デモ: モック実装
             time.sleep(2)
             health_status = {
                 "interfaces": "✅ All UP",
                 "bgp": "✅ Established",
-                "cpu": "✅ 15% (Normal)",
-                "memory": "✅ 70% free",
-                "errors": "✅ None",
                 "overall": "HEALTHY"
             }
             return RemediationResult(
@@ -406,33 +382,22 @@ def _remediation_verify(
                 status="success",
                 data=health_status
             )
-        
         elif environment == RemediationEnvironment.TEST:
-            # テスト: 実装予定
             time.sleep(2)
-            health_status = {
-                "overall": "HEALTHY",
-                "details": "Test environment verification"
-            }
+            health_status = {"overall": "HEALTHY"}
             return RemediationResult(
                 step_name="Verify",
                 status="success",
                 data=health_status
             )
-        
-        else:  # PRODUCTION
-            # 本番: 実装予定
+        else:
             time.sleep(2)
-            health_status = {
-                "overall": "HEALTHY",
-                "details": "Production environment verification"
-            }
+            health_status = {"overall": "HEALTHY"}
             return RemediationResult(
                 step_name="Verify",
                 status="success",
                 data=health_status
             )
-    
     except Exception as e:
         return RemediationResult(
             step_name="Verify",
@@ -441,24 +406,61 @@ def _remediation_verify(
         )
 
 
-def _get_fix_commands_for_scenario(device_id: str, scenario: str) -> List[str]:
+def _get_fix_commands_for_scenario(device_id: str, scenario: str) -> list:
     """シナリオに応じた修復コマンドを取得"""
     scenario_commands = {
         "BGPルートフラッピング": [
             "router bgp 65000",
             "bgp graceful-restart restart-time 120",
-            "address-family ipv4",
-            "neighbor 203.0.113.2 soft-reconfiguration inbound",
-            "exit-address-family",
         ],
         "インターフェースダウン": [
             "interface GigabitEthernet0/0/0",
             "no shutdown",
-            "exit",
-        ],
-        "メモリリーク": [
-            "clear processes memory",
         ],
     }
+    return scenario_commands.get(scenario, ["! No commands"])
+
+
+# =====================================================
+
+def predict_initial_symptoms(scenario_name, api_key):
+    """
+    障害シナリオ名から、発生しうる「初期症状（アラーム、ログ、Pingなど）」を
+    AIに推論させ、ベイズエンジンへの入力データとして返す。
+    """
+    if not api_key: return {}
     
-    return scenario_commands.get(scenario, ["! No commands for scenario"])
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+    
+    prompt = f"""
+    あなたはネットワーク監視システムのAIエージェントです。
+    指定された「障害シナリオ」において、監視システムが最初に検知するであろう「初期症状」を推論してください。
+
+    **シナリオ**: {scenario_name}
+
+    【出力要件】
+    1. 以下のキーを持つ **JSON形式** で出力すること。解説は不要。
+       - "alarm": アラームメッセージ (例: "BGP Flapping", "Fan Fail", "Power Supply Failed", "HA Failover")
+       - "ping": 疎通状態 (例: "NG", "OK")
+       - "log": ログキーワード (例: "Interface Down", "System Warning", "Power Fail")
+    
+    2. 値は以下のキーワードリストから最も適切なものを選んでください（これらに当てはまらない場合は空文字 "" にすること）。
+       - アラーム系: "BGP Flapping", "Fan Fail", "Heartbeat Loss", "Connection Lost", "Power Supply 1 Failed", "Power Supply: Dual Loss (Device Down)"
+       - ログ系: "Interface Down", "Power Fail", "Config Error", "High Temperature"
+       - Ping系: "NG", "OK"
+
+    **例**:
+    シナリオ: "[WAN] BGPルートフラッピング"
+    出力: {{ "alarm": "BGP Flapping", "ping": "OK", "log": "" }}
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        text = response.text
+        # Markdownのコードブロック記号を削除してJSONパース
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"Symptom Prediction Error: {e}")
+        return {}
