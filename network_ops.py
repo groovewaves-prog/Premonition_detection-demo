@@ -510,6 +510,93 @@ def predict_initial_symptoms(scenario_name, api_key):
 # 【新規】パフォーマンス改善：キャッシング + ストリーミング
 # =====================================================
 
+# =====================================================
+# 【新規】ハルシネーション防止フィルター
+# =====================================================
+
+def filter_hallucination(text: str) -> str:
+    """
+    AI生成テキストからハルシネーション（不確かな情報）をフィルタリング
+    
+    除去対象:
+    - 免責事項
+    - 不確実性表現（～可能性、～推定、～と考えられます）
+    - 警告文
+    - 注記
+    
+    Args:
+        text: AI生成テキスト
+    
+    Returns:
+        str: フィルタリング後のテキスト
+    """
+    import re
+    
+    # 除去対象パターンのリスト
+    patterns_to_remove = [
+        # 免責事項
+        (r'【免責事項】.*?(?=##|$)', '', re.DOTALL),
+        (r'免責事項.*?(?=##|$)', '', re.DOTALL),
+        (r'本レポートは.*?必要となる場合があります。\n*', ''),
+        
+        # 注記・警告
+        (r'【注記】.*?(?=##|$)', '', re.DOTALL),
+        (r'【警告】.*?(?=##|$)', '', re.DOTALL),
+        (r'注記:.*?(?=##|$)', '', re.DOTALL),
+        (r'警告:.*?(?=##|$)', '', re.DOTALL),
+        (r'※.*?\n', ''),
+        
+        # 不確実性表現（ただし物理的に不可能な場合のみ除去）
+        (r'ただし、.*?(?=\n##|\n\n|$)', ''),  # セクション間の「ただし」を除去
+        (r'なお、.*?(?=\n##|\n\n|$)', ''),
+        
+        # 重複した空行を削除
+        (r'\n\n\n+', '\n\n'),
+    ]
+    
+    filtered_text = text
+    for pattern, replacement, *flags in patterns_to_remove:
+        flag = flags[0] if flags else 0
+        filtered_text = re.sub(pattern, replacement, filtered_text, flags=flag)
+    
+    # 先頭・末尾の空白を削除
+    filtered_text = filtered_text.strip()
+    
+    return filtered_text
+
+
+def validate_response(response) -> bool:
+    """
+    API レスポンスの有効性をチェック
+    
+    Args:
+        response: Google Generative AI の Response オブジェクト
+    
+    Returns:
+        bool: 有効な応答の場合 True
+    """
+    try:
+        if not response:
+            return False
+        
+        # candidates が存在し、内容がある確認
+        if not hasattr(response, 'candidates') or not response.candidates:
+            return False
+        
+        # 最初の candidate に text が含まれているか確認
+        candidate = response.candidates[0]
+        if not hasattr(candidate, 'content') or not candidate.content:
+            return False
+        
+        # 実際にテキストが含まれているか確認
+        if hasattr(candidate.content, 'parts') and len(candidate.content.parts) == 0:
+            return False
+        
+        return True
+    except Exception as e:
+        return False
+
+
 def compute_cache_hash(scenario: str, device_id: str, topology_context: str = "", config: str = "") -> str:
     """
     キャッシュキーを生成（MD5ハッシュ）
@@ -531,7 +618,10 @@ def generate_analyst_report_streaming(scenario, target_node, topology_context, t
     """
     ストリーミング版：原因分析専用レポート生成
     
-    ★改善: リトライ機能 + エラーハンドリング追加
+    ★改善: 
+    - プロンプト厳密化（免責事項禁止）
+    - ハルシネーション防止フィルター
+    - 応答有効性チェック
     
     Args:
         scenario: 障害シナリオ
@@ -540,8 +630,8 @@ def generate_analyst_report_streaming(scenario, target_node, topology_context, t
         target_conf: 対象設定
         verification_context: 検証コンテキスト
         api_key: Google API Key
-        max_retries: 最大リトライ回数（デフォルト: 2回）
-        backoff: リトライ間隔（秒、指数バックオフ）
+        max_retries: 最大リトライ回数
+        backoff: リトライ間隔
     
     Yields:
         str: AI の出力をチャンク単位で返す
@@ -558,33 +648,70 @@ def generate_analyst_report_streaming(scenario, target_node, topology_context, t
             vendor = target_node.metadata.get("vendor", "Unknown")
             os_type = target_node.metadata.get("os", "Unknown OS")
             
+            # ★厳密化されたプロンプト
             prompt = f"""
-            ネットワーク障害の原因分析レポートを生成してください。
+ネットワーク障害の原因分析レポートを生成してください。
+
+【必須ルール】
+1. 免責事項・注記・警告は一切含めない
+2. 不確実性表現（「可能性」「推定」「と考えられます」）を最小化
+3. 確信がない場合は「情報不足により判断不可」と明記
+4. 技術的で客観的な分析のみ
+
+【入力情報】
+- シナリオ: {scenario}
+- デバイス: {target_node.id}
+- ベンダー: {vendor}
+- OS: {os_type}
+
+【出力セクション】（以下のみ出力）
+
+## 障害概要
+{scenario} におけるネットワーク障害の概要
+
+## 発生原因
+観測されたログ・状態から判断される技術的根拠に基づく原因
+
+## 影響範囲
+影響を受けたシステム・サービス・ユーザー
+
+## 技術的根拠
+分析の根拠となるログ出力・メトリクス・状態
+
+## 切り分け判断
+原因判定のプロセスと判断基準
+"""
             
-            シナリオ: {scenario}
-            デバイス: {target_node.id}
-            ベンダー: {vendor}
-            OS: {os_type}
-            
-            出力: Markdown形式で、以下セクションで構成
-            - 障害概要
-            - 発生原因
-            - 影響範囲
-            - 技術的根拠
-            - 切り分け判断の理由
-            
-            ★重要: 復旧コマンドやロールバック手順は含めないでください。
-            """
-            
-            # ストリーミング有効でレスポンスを取得
+            # ストリーミング実行
             response = model.generate_content(prompt, stream=True)
             
+            # ★応答の有効性をチェック
+            if not validate_response(response):
+                if attempt < max_retries:
+                    wait_time = backoff ** attempt
+                    yield f"\n\n⏳ **無効な応答を受けました。{wait_time}秒後に再試行します...**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield "❌ API から有効な応答が得られませんでした。時間をおいて再度お試しください。"
+                    return
+            
             # チャンク単位で yield
+            full_text = ""
             for chunk in response:
                 if chunk.text:
+                    full_text += chunk.text
                     yield chunk.text
             
-            # 成功時はリトライループを抜ける
+            # ★ハルシネーション防止フィルターを適用
+            filtered_text = filter_hallucination(full_text)
+            
+            # フィルタリング後のテキストを yield
+            if len(filtered_text) < len(full_text):
+                # フィルタリングで内容が除去された場合、差分を yield
+                yield ""  # 一度クリア
+                yield filtered_text
+            
             return
         
         except Exception as e:
@@ -593,7 +720,6 @@ def generate_analyst_report_streaming(scenario, target_node, topology_context, t
             # 503エラーの場合はリトライ
             if "503" in error_msg or "overloaded" in error_msg.lower():
                 if attempt < max_retries:
-                    # リトライ予告を yield
                     wait_time = backoff ** attempt
                     yield f"\n\n⏳ **API混雑中です。{wait_time}秒後に再試行します...**\n\n"
                     time.sleep(wait_time)
@@ -602,8 +728,7 @@ def generate_analyst_report_streaming(scenario, target_node, topology_context, t
                     yield f"\n\n❌ **API が混雑しており、レポート生成に失敗しました。しばらく時間をおいて再度お試しください。**"
                     return
             else:
-                # その他のエラーはリトライしない
-                yield f"Error: {e}"
+                yield f"❌ エラーが発生しました: {error_msg}"
                 return
 
 
@@ -611,7 +736,10 @@ def generate_remediation_commands_streaming(scenario, analysis_result, target_no
     """
     ストリーミング版：復旧手順生成
     
-    ★改善: リトライ機能 + エラーハンドリング追加
+    ★改善: 
+    - プロンプト厳密化
+    - ハルシネーション防止フィルター
+    - 応答有効性チェック
     
     Yields:
         str: AI の出力をチャンク単位で返す
@@ -625,28 +753,67 @@ def generate_remediation_commands_streaming(scenario, analysis_result, target_no
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
             
+            # ★厳密化されたプロンプト
             prompt = f"""
-            以下の原因分析を踏まえて、復旧手順を生成してください。
-            
-            分析結果: {analysis_result}
-            シナリオ: {scenario}
-            デバイス: {target_node.id}
-            
-            出力フォーマット:
-            - 実施前提・注意点
-            - バックアップ手順
-            - 復旧手順
-            - ロールバック手順
-            - 正常性確認コマンド
-            """
+以下の原因分析を踏まえて、復旧手順を生成してください。
+
+【必須ルール】
+1. 実行可能で具体的な手順のみ
+2. 免責事項・警告は含めない
+3. 不確実性表現を最小化
+4. 操作ステップは明確に番号付け
+
+【入力情報】
+原因分析結果: {analysis_result}
+シナリオ: {scenario}
+デバイス: {target_node.id}
+
+【出力セクション】（以下のみ出力）
+
+## 実施前提・事前確認
+復旧実施前の確認項目
+
+## バックアップ手順
+現在の設定・状態をバックアップする手順
+
+## 復旧手順
+障害を復旧するための具体的な操作手順（番号付き）
+
+## ロールバック手順
+復旧に失敗した場合、元の状態に戻す手順
+
+## 正常性確認コマンド
+復旧完了を確認するためのコマンド・チェック項目
+"""
             
             response = model.generate_content(prompt, stream=True)
             
+            # ★応答の有効性をチェック
+            if not validate_response(response):
+                if attempt < max_retries:
+                    wait_time = backoff ** attempt
+                    yield f"\n\n⏳ **無効な応答を受けました。{wait_time}秒後に再試行します...**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield "❌ API から有効な応答が得られませんでした。時間をおいて再度お試しください。"
+                    return
+            
+            # チャンク単位で yield
+            full_text = ""
             for chunk in response:
                 if chunk.text:
+                    full_text += chunk.text
                     yield chunk.text
             
-            # 成功時はリトライループを抜ける
+            # ★ハルシネーション防止フィルターを適用
+            filtered_text = filter_hallucination(full_text)
+            
+            # フィルタリング後のテキストを yield
+            if len(filtered_text) < len(full_text):
+                yield ""
+                yield filtered_text
+            
             return
         
         except Exception as e:
@@ -663,5 +830,5 @@ def generate_remediation_commands_streaming(scenario, analysis_result, target_no
                     yield f"\n\n❌ **API が混雑しており、復旧プラン生成に失敗しました。しばらく時間をおいて再度お試しください。**"
                     return
             else:
-                yield f"Error: {e}"
+                yield f"❌ エラーが発生しました: {error_msg}"
                 return
