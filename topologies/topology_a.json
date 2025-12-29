@@ -1,0 +1,125 @@
+{
+  "WAN_ROUTER_01": {
+    "layer": 1,
+    "type": "ROUTER",
+    "parent_id": null,
+    "redundancy_group": null,
+    "metadata": {
+      "redundancy_type": "PSU",
+      "vendor": "Cisco",
+      "os": "IOS-XE",
+      "model": "ISR 4451-X",
+      "hw_inventory": {
+        "psu_count": 2,
+        "fan_count": 3
+      }
+    }
+  },
+  "FW_01_PRIMARY": {
+    "layer": 2,
+    "type": "FIREWALL",
+    "parent_id": "WAN_ROUTER_01",
+    "redundancy_group": "FW_HA_GROUP",
+    "metadata": {
+      "redundancy_type": "PSU",
+      "role": "Active",
+      "vendor": "Juniper",
+      "os": "Junos OS",
+      "model": "SRX300",
+      "hw_inventory": {
+        "psu_count": 2
+      }
+    }
+  },
+  "FW_01_SECONDARY": {
+    "layer": 2,
+    "type": "FIREWALL",
+    "parent_id": "WAN_ROUTER_01",
+    "redundancy_group": "FW_HA_GROUP",
+    "metadata": {
+      "redundancy_type": "PSU",
+      "role": "Standby",
+      "vendor": "Juniper",
+      "os": "Junos OS",
+      "model": "SRX300",
+      "hw_inventory": {
+        "psu_count": 2
+      }
+    }
+  },
+  "CORE_SW_01": {
+    "layer": 3,
+    "type": "SWITCH",
+    "parent_id": "FW_01_PRIMARY",
+    "redundancy_group": null,
+    "metadata": {
+      "redundancy_type": "PSU",
+      "vendor": "Cisco",
+      "os": "IOS-XE",
+      "model": "Catalyst 9300",
+      "hw_inventory": {
+        "psu_count": 2
+      }
+    }
+  },
+  "L2_SW_01": {
+    "layer": 4,
+    "type": "SWITCH",
+    "parent_id": "CORE_SW_01",
+    "redundancy_group": null,
+    "metadata": {
+      "redundancy_type": "PSU",
+      "location": "Floor 1",
+      "vendor": "Cisco",
+      "os": "IOS-XE"
+    }
+  },
+  "L2_SW_02": {
+    "layer": 4,
+    "type": "SWITCH",
+    "parent_id": "CORE_SW_01",
+    "redundancy_group": null,
+    "metadata": {
+      "redundancy_type": "PSU",
+      "location": "Floor 2",
+      "vendor": "Cisco",
+      "os": "IOS-XE"
+    }
+  },
+  "AP_01": {
+    "layer": 5,
+    "type": "ACCESS_POINT",
+    "parent_id": "L2_SW_01",
+    "redundancy_group": null,
+    "metadata": {
+      "location": "Meeting Room A"
+    }
+  },
+  "AP_02": {
+    "layer": 5,
+    "type": "ACCESS_POINT",
+    "parent_id": "L2_SW_01",
+    "redundancy_group": null,
+    "metadata": {
+      "location": "Office Area North"
+    }
+  },
+  "AP_03": {
+    "layer": 5,
+    "type": "ACCESS_POINT",
+    "parent_id": "L2_SW_02",
+    "redundancy_group": null,
+    "metadata": {
+      "location": "Office Area South"
+    }
+  },
+  "AP_04": {
+    "layer": 5,
+    "type": "ACCESS_POINT",
+    "parent_id": "L2_SW_02",
+    "redundancy_group": null,
+    "metadata": {
+      "location": "Cafeteria"
+    }
+  }
+}
