@@ -3,7 +3,7 @@
 AIOps Incident Cockpit - Multi-Site Edition
 =============================================
 複数拠点対応版 AIOps インシデント・コックピット
-前回のUXと機能を完全に復元
+[修正] 重複していた予兆検知バナーを削除
 """
 
 import streamlit as st
@@ -818,15 +818,6 @@ def render_sidebar():
 def render_topology_graph(topology: dict, alarms: List[Alarm], analysis_results: List[dict]):
     """
     トポロジーグラフを生成
-    
-    ■ ノード色の定義（永続的ルール）
-    | 状態 | 色 | 条件 |
-    |------|-----|------|
-    | 根本原因（サービス停止） | 赤色 #ffcdd2 | 両系障害、CRITICAL |
-    | 根本原因（冗長性低下） | 黄色 #fff9c4 | 片系障害、WARNING |
-    | サイレント障害疑い | 薄紫色 #e1bee7 | is_silent_suspect=True |
-    | 影響デバイス | グレー #cfd8dc | is_root_cause=False & アラームあり |
-    | 正常 | グリーン #e8f5e9 | 問題なし |
     """
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
@@ -1130,27 +1121,15 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     if root_cause_candidates and downstream_devices:
         st.info(f"📍 **根本原因**: {root_cause_candidates[0]['id']} → 影響範囲: 配下 {len(downstream_devices)} 機器")
     
-    # ★ Digital Twin 予兆検知バナー（2軸表示: 早期予兆 + 急性期）
-    prediction_candidates = [c for c in root_cause_candidates if c.get('is_prediction')]
-    if prediction_candidates:
-        pred = prediction_candidates[0]
-        timeline = pred.get('prediction_timeline', '不明')
-        affected = pred.get('prediction_affected_count', 0)
-        early_hours = pred.get('prediction_early_warning_hours', 0)
-        if early_hours >= 24:
-            early_str = f"{early_hours // 24}日前"
-        else:
-            early_str = f"{early_hours}時間前" if early_hours > 0 else "不明"
-        st.warning(
-            f"🔮 **Digital Twin 予兆検知**: {pred['id']} で障害兆候を検出\n\n"
-            f"　　**早期予兆**: 最大 **{early_str}** から検知可能なパターン\n\n"
-            f"　　**急性期**: 発症後 **{timeline}** に深刻化する恐れ（**{affected}台** に影響）\n\n"
-            f"　　**推奨**: 次回メンテナンスウィンドウでの予防交換/対応"
-        )
+    # ★ Digital Twin 予兆検知バナー表示の削除箇所
+    # (ここに以前あった st.warning(...) ブロックを削除しました)
+    # 2025-02-12: ユーザー要望により削除（Future Radarと重複するため）
     
     # =====================================================
     # 🔮 AIOps Future Radar（予兆専用表示エリア）
     # =====================================================
+    prediction_candidates = [c for c in root_cause_candidates if c.get('is_prediction')]
+    
     if prediction_candidates:
         st.markdown("### 🔮 AIOps Future Radar")
         
