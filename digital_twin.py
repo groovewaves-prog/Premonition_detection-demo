@@ -239,7 +239,7 @@ class DigitalTwinEngine:
         # 複数シグナルの注釈
         multi_signal_note = ""
         if extra_signal_count > 0:
-            boost_val = min(extra_signals * boost_factor, 0.20)
+            boost_val = min(extra_signal_count * boost_factor, 0.20)
             multi_signal_note = f"\n・相関分析: 他 {extra_signal_count} 件の関連シグナルを検知 (確信度 +{boost_val:.0%})"
 
         # メインの検知根拠
@@ -265,7 +265,7 @@ class DigitalTwinEngine:
             "is_prediction": True,
             # UI表示用のメタデータ
             "prediction_timeline": f"{rule.time_to_critical_min}分後",
-            "prediction_early_warning": early_str,
+            "prediction_early_warning_hours": rule.early_warning_hours,
             "prediction_affected_count": impact_count,
             "prediction_escalated_state": rule.escalated_state
         }
