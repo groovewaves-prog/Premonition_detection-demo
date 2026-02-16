@@ -28,9 +28,9 @@ class EscalationRule:
     
     recommended_actions: List[Dict[str, str]] = field(default_factory=list)
     runbook_url: str = ""
-    criticality: str = "standard" # "critical" or "standard"
+    criticality: str = "standard"
     
-    # Persisted thresholds (Optional override)
+    # Persisted thresholds
     paging_threshold: Optional[float] = None
     logging_threshold: Optional[float] = None
     
@@ -49,29 +49,53 @@ class EscalationRule:
                 self._metric_regex = re.compile(self.trend_metric_regex, re.IGNORECASE)
             except: pass
 
-# Default Rules (Zero-Shot Knowledge)
+# --- Enhanced Default Rules for Simulation Scenarios ---
 DEFAULT_RULES = [
-    EscalationRule("optical", ["rx power", "optical signal", "transceiver", "light level", "dbm"], "光信号劣化による突然のリンクダウン", 60, 336, 0.95, "Hardware/Optical", 0.45,
+    # 1. Optical Decay (光減衰)
+    EscalationRule("optical", ["rx power", "optical signal", "transceiver", "light level", "dbm"], 
+                   "光信号劣化によるリンクダウン", 60, 336, 0.95, "Hardware/Optical", 0.45,
                    requires_trend=True, trend_metric_regex=r"([-\d\.]+)\s*dBm", trend_min_slope=-0.05, 
                    metric_name="rx_power_dbm", risk_bias_offset=-0.2, criticality="critical",
-                   recommended_actions=[{"title": "SFPモジュールの予備交換", "effect": "トランシーバ故障による劣化を解消"}]),
-    EscalationRule("stp_loop", ["stp loop", "tcn received", "blocking port"], "L2ループによるブロードキャストストーム", 5, 24, 0.95, "Network/L2", 0.42,
+                   recommended_actions=[{"title": "SFPモジュールの予備交換", "effect": "トランシーバ故障による劣化を解消"}, {"title": "光ファイバー清掃", "effect": "汚れによる減衰を回復"}],
+                   runbook_url="https://wiki.company.com/ops/optical_troubleshooting"),
+    
+    # 2. Microburst (パケット破棄) -> Queue Drops
+    EscalationRule("microburst", ["queue drops", "buffer overflow", "output drops", "asic_error", "qos-4-policer"], 
+                   "マイクロバーストによるバッファ枯渇", 15, 24, 0.85, "Network/QoS", 0.45,
+                   requires_volatility=True, max_volatility=100.0,
+                   recommended_actions=[{"title": "QoSポリシーの調整", "effect": "バッファ割り当ての最適化"}, {"title": "帯域増強", "effect": "物理的な輻輳解消"}],
+                   runbook_url="https://wiki.company.com/ops/qos_tuning"),
+
+    # 3. Route Instability (経路揺らぎ) -> BGP/OSPF
+    EscalationRule("route_instability", ["bgp.*change", "neighbor.*down", "route updates", "retransmission"], 
+                   "経路不安定による大規模通信断", 30, 48, 0.90, "Network/Routing", 0.45,
+                   recommended_actions=[{"title": "BGPフラップダンピングの確認", "effect": "不安定な経路の抑制"}, {"title": "ルート広報の検証", "effect": "誤った経路情報の修正"}]),
+
+    # 4. STP Loop
+    EscalationRule("stp_loop", ["stp loop", "tcn received", "blocking port"], 
+                   "L2ループによるブロードキャストストーム", 5, 24, 0.95, "Network/L2", 0.42,
                    risk_bias_offset=-0.5, criticality="critical",
                    recommended_actions=[{"title": "該当ポートのshutdown", "effect": "ループ源を物理的に遮断"}]),
-    EscalationRule("memory_leak", ["memory usage high", "malloc fail"], "メモリ枯渇によるシステムクラッシュ", 180, 336, 0.85, "Software/Resource", 0.38,
+
+    # 5. Resource / Generic
+    EscalationRule("memory_leak", ["memory usage high", "malloc fail"], 
+                   "メモリ枯渇によるシステムクラッシュ", 180, 336, 0.85, "Software/Resource", 0.38,
                    requires_trend=True, trend_metric_regex=r"usage (\d+)%", trend_min_slope=1.0, 
                    metric_name="memory_usage_pct",
                    recommended_actions=[{"title": "計画的再起動(Reload)", "effect": "メモリ領域を開放"}]),
-    EscalationRule("generic_error", ["error", "fail", "critical", "warning"], "未分類のサービス劣化", 30, 24, 0.50, "Generic", 0.35,
+    
+    EscalationRule("generic_error", ["error", "fail", "critical", "warning"], 
+                   "未分類のサービス劣化", 30, 24, 0.50, "Generic", 0.35,
                    requires_volatility=True, trend_metric_regex=r"time=(\d+)ms", max_volatility=50.0, 
                    metric_name="latency_ms", risk_bias_offset=0.5,
                    recommended_actions=[{"title": "ログ詳細調査", "effect": "原因特定"}]),
-    EscalationRule("analysis_signal", ["analysis_anomaly"], "AI分析による異常検知", 30, 24, 0.60, "Generic", 0.5,
+    
+    EscalationRule("analysis_signal", ["analysis_anomaly"], 
+                   "AI分析による異常検知", 30, 24, 0.60, "Generic", 0.5,
                    risk_bias_offset=0.2,
                    recommended_actions=[{"title": "詳細分析確認", "effect": "状況把握"}]),
 ]
 
-# Signatures for maintenance detection
 MAINTENANCE_SIGNATURES = [
     (r"administratively down", 0.9), (r"ifAdminStatus.*down", 0.9), 
     (r"reload requested by", 0.9), (r"system reboot", 0.8), 
