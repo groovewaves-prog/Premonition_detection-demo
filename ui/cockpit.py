@@ -24,10 +24,8 @@ from network_ops import (
     sanitize_output
 )
 
-# === インポート修正: 機能別に正しいモジュールから読み込む ===
 from utils.helpers import get_status_from_alarms, get_status_icon, load_config_by_id
 from utils.llm_helper import get_rate_limiter, generate_content_with_retry
-
 from verifier import verify_log_content
 from .graph import render_topology_graph
 
@@ -114,7 +112,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     display_name = get_display_name(site_id)
     scenario = st.session_state.site_scenarios.get(site_id, "正常稼働")
     
-    # ヘッダー & 戻るボタン
     col_header = st.columns([4, 1])
     with col_header[0]:
         st.markdown(f"### 🛡️ AIOps インシデント・コックピット")
@@ -141,7 +138,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             st.session_state.active_site = None
             st.rerun()
     
-    # データ読み込み
     paths = get_paths(site_id)
     topology = load_topology(paths.topology_path)
     if not topology:
@@ -156,7 +152,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         for m in injected.get("messages", []):
             alarms.append(Alarm(injected["device_id"], m, "INFO", False))
 
-    # 分析エンジン
     engine_key = f"engine_{site_id}"
     if engine_key not in st.session_state.logic_engines:
         st.session_state.logic_engines[engine_key] = LogicalRCA(topology)
@@ -166,7 +161,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         "id": "SYSTEM", "label": "正常稼働", "prob": 0.0, "type": "Normal", "tier": 3, "reason": "アラームなし"
     }]
     
-    # KPIメトリクス
     root_cause_alarms = [a for a in alarms if a.is_root_cause]
     total_alarms = len(alarms)
     noise_reduction = ((total_alarms - len(root_cause_alarms)) / total_alarms * 100) if total_alarms > 0 else 0.0
@@ -190,40 +184,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     
     st.markdown("---")
     
-    # =====================================================
-    # インシデント候補 & 影響範囲リストの分離 (UX完全復元)
-    # =====================================================
-    root_cause_ids = {a.device_id for a in alarms if a.is_root_cause}
-    downstream_ids = {a.device_id for a in alarms if not a.is_root_cause}
-    
-    rc_candidates = []
-    ds_devices = []
-    
-    for cand in analysis_results:
-        device_id = cand.get('id', '')
-        # ★重要: オリジナルの優先順位を厳密に再現
-        # 1. 予兆判定
-        if cand.get('is_prediction'):
-            rc_candidates.append(cand)
-        # 2. 根本原因フラグあり
-        elif device_id in root_cause_ids:
-            rc_candidates.append(cand)
-        # 3. 影響デバイス（下流）に含まれるか？ -> ここで分離しないと、次のprob判定で吸い込まれる
-        elif device_id in downstream_ids:
-            ds_devices.append(cand)
-        # 4. その他の高確度アラート
-        elif cand.get('prob', 0) > 0.5:
-            rc_candidates.append(cand)
-            
-    if not rc_candidates and not alarms:
-        rc_candidates = [{"id": "SYSTEM", "label": "正常稼働", "prob": 0.0, "type": "Normal"}]
-
-    # ★ 青帯バナー（根本原因と影響範囲のサマリ）の復活
-    if rc_candidates and ds_devices:
-        top_cause = rc_candidates[0]['id']
-        st.info(f"📍 **根本原因**: {top_cause} → 影響範囲: 配下 {len(ds_devices)} 機器")
-
-    # Future Radar
+    # --- Future Radar (Visuals Restored) ---
     preds = [c for c in analysis_results if c.get('is_prediction')]
     if preds:
         st.markdown("### 🔮 AIOps Future Radar")
@@ -236,14 +197,53 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             for idx, item in enumerate(preds[:3]):
                 with radar_cols[idx]:
                     prob_pct = f"{item.get('prob',0)*100:.0f}%"
+                    pred_timeline = item.get('prediction_timeline','不明')
+                    pred_affected = item.get('prediction_affected_count', 0)
+                    pred_early_hours = item.get('prediction_early_warning_hours', 0)
+                    
+                    if pred_early_hours >= 24:
+                        early_display = f"最大 **{pred_early_hours // 24}日前** から検知可能"
+                    elif pred_early_hours > 0:
+                        early_display = f"最大 **{pred_early_hours}時間前** から検知可能"
+                    else:
+                        early_display = "不明"
+
                     st.error(f"**📍 {item['id']}**")
                     st.markdown(f"<div style='text-align:center;'><span style='font-size:36px;font-weight:bold;color:#d32f2f;'>{prob_pct}</span><br>発生確率</div>", unsafe_allow_html=True)
                     st.divider()
                     st.markdown(f"**予測障害:** {item.get('label','').replace('🔮 [予兆] ', '')}")
-                    st.markdown(f"**急性期:** {item.get('prediction_timeline','不明')}")
+                    # ★ ここが復活: 早期予兆と影響範囲の表示
+                    st.markdown(f"**早期予兆:** {early_display}")
+                    st.markdown(f"**急性期:** 発症後 {pred_timeline} に深刻化")
+                    st.markdown(f"**影響範囲:** 配下 {pred_affected} 台が通信断の恐れ")
+                    
                     with st.expander("🔍 検知詳細"):
                         st.text(item.get('reason', ''))
         st.markdown("---")
+
+    root_cause_ids = {a.device_id for a in alarms if a.is_root_cause}
+    downstream_ids = {a.device_id for a in alarms if not a.is_root_cause}
+    
+    rc_candidates = []
+    ds_devices = []
+    
+    for c in analysis_results:
+        did = c.get('id')
+        if c.get('is_prediction'):
+            rc_candidates.append(c)
+        elif did in root_cause_ids:
+            rc_candidates.append(c)
+        elif did in downstream_ids:
+            ds_devices.append(c)
+        elif c.get('prob', 0) > 0.5:
+            rc_candidates.append(c)
+            
+    if not rc_candidates and not alarms:
+        rc_candidates = [{"id": "SYSTEM", "label": "正常稼働", "prob": 0.0, "type": "Normal"}]
+
+    if rc_candidates and ds_devices:
+        top_cause = rc_candidates[0]['id']
+        st.info(f"📍 **根本原因**: {top_cause} → 影響範囲: 配下 {len(ds_devices)} 機器")
 
     selected_cand = None
     target_dev_id = None
@@ -276,7 +276,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             selected_cand = rc_candidates[0]
             target_dev_id = rc_candidates[0]['id']
 
-        # ★ 影響を受けている機器（上流復旧待ち）リストの復活
         if ds_devices:
             with st.expander(f"▼ 影響を受けている機器 ({len(ds_devices)}台) - 上流復旧待ち", expanded=False):
                 dd_df = pd.DataFrame([
@@ -289,7 +288,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 else:
                     st.dataframe(dd_df, use_container_width=True, hide_index=True)
 
-    # 2カラムレイアウト
     col_map, col_chat = st.columns([1.2, 1])
     
     with col_map:
