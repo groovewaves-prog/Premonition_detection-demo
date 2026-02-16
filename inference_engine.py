@@ -1,3 +1,4 @@
+# inference_engine.py
 import json
 import os
 import re
@@ -6,9 +7,9 @@ from typing import List, Dict, Any, Optional
 
 import google.generativeai as genai
 
-# --- Digital Twin Integration (graceful degradation) ---
+# --- Digital Twin Integration (V45 Package) ---
 try:
-    from digital_twin import DigitalTwinEngine
+    from digital_twin_pkg import DigitalTwinEngine
     DIGITAL_TWIN_AVAILABLE = True
 except ImportError:
     DIGITAL_TWIN_AVAILABLE = False
@@ -24,9 +25,8 @@ class HealthStatus(Enum):
 
 class LogicalRCA:
     """
-    LogicalRCA (v5 - Production Fix):
-      - 障害(CRITICAL)を予兆(Prediction)より優先して表示するソートロジックを実装
-      - result辞書に 'status' フィールドを追加し、Digital Twin側のフィルタリングを支援
+    LogicalRCA (v5.1 - V45 Integrated):
+      - Uses digital_twin_pkg.DigitalTwinEngine
     """
 
     SILENT_MIN_CHILDREN = 2
@@ -60,8 +60,12 @@ class LogicalRCA:
         self.digital_twin = None
         if DIGITAL_TWIN_AVAILABLE:
             try:
+                # V45 Engine Initialization
+                # tenant_id defaults to "default", data is stored in ./data/default
                 self.digital_twin = DigitalTwinEngine(
-                    self.topology, self.children_map
+                    topology=self.topology, 
+                    children_map=self.children_map,
+                    tenant_id="default" 
                 )
             except Exception as e:
                 print(f"[!] Digital Twin initialization failed: {e}")
@@ -88,12 +92,6 @@ class LogicalRCA:
         if hasattr(info, "metadata"):
             md = getattr(info, "metadata")
             return md if isinstance(md, dict) else {}
-        if hasattr(info, "get_metadata"):
-            try:
-                md = info.get_metadata("metadata", {})
-                return md if isinstance(md, dict) else {}
-            except Exception:
-                return {}
         return {}
 
     def _get_psu_count(self, device_id: str, default: int = 1) -> int:
@@ -220,21 +218,9 @@ class LogicalRCA:
         for parent_id, info in silent_suspects.items():
             msg_map.setdefault(parent_id, []).append("Silent Failure Suspected")
 
-        alarmed_ids = set(msg_map.keys())
-
-        def parent_is_alarmed(dev: str) -> bool:
-            p = self._get_parent_id(dev)
-            return bool(p and (p in alarmed_ids))
-
-        def parent_is_silent_suspect(dev: str) -> bool:
-            p = self._get_parent_id(dev)
-            return bool(p and (p in silent_suspects))
-
         results: List[Dict[str, Any]] = []
 
         for device_id, messages in msg_map.items():
-            # ... (中略: Silent/Cascade ロジックは維持) ...
-            
             # 親がサイレント疑い
             if device_id in silent_suspects:
                 info = silent_suspects[device_id]
@@ -245,14 +231,14 @@ class LogicalRCA:
                     "type": "Network/SilentFailure",
                     "tier": 1,
                     "reason": f"Silent failure suspected.",
-                    "status": "YELLOW" # Assume Warning level for silent suspect
+                    "status": "YELLOW",
+                    "is_prediction": False
                 })
                 continue
 
             # 通常分析
             analysis = self.analyze_redundancy_depth(device_id, messages)
             
-            # ステータス文字列の取得 (RED/YELLOW/GREEN)
             status_val = analysis["status"].value 
 
             if analysis.get("impact_type") == "UNKNOWN" and "API key not configured" in analysis.get("reason", ""):
@@ -260,7 +246,7 @@ class LogicalRCA:
                 tier = 3
             else:
                 if analysis["status"] == HealthStatus.CRITICAL:
-                    prob = 0.95 # 明確に高く設定
+                    prob = 0.95
                     tier = 1
                 elif analysis["status"] == HealthStatus.WARNING:
                     prob = 0.7
@@ -276,7 +262,8 @@ class LogicalRCA:
                 "type": analysis.get("impact_type", "UNKNOWN"),
                 "tier": tier,
                 "reason": analysis.get("reason", "AI provided no reason"),
-                "status": status_val # ★ Digital Twinのフィルタ用に必須
+                "status": status_val,
+                "is_prediction": False
             })
 
         # ==========================================================
@@ -291,37 +278,21 @@ class LogicalRCA:
                 )
 
                 if predictions:
-                    # predictions は既に predict メソッド内で
-                    # 「障害発生済み機器」を除外しているはずだが、
-                    # 念のためここでも重複IDを除外してマージする
-                    
-                    # 既存の結果IDリスト
                     existing_ids = {r["id"] for r in results}
-                    
-                    # 新規の予兆のみ追加
                     for pred in predictions:
                         if pred["id"] not in existing_ids:
                             results.append(pred)
                         else:
-                            # 既存結果がある場合、CRITICALでないなら予兆情報で上書き/補強も検討できるが、
-                            # 今回は「障害優先」のため、既存がCRITICALなら予兆は捨てる
+                            # 既存がCRITICAL未満なら予兆を優先
                             existing = next((r for r in results if r["id"] == pred["id"]), None)
-                            if existing and existing.get("prob", 0) < 0.8: # CRITICAL未満なら予兆を優先
+                            if existing and existing.get("prob", 0) < 0.8:
                                 results.remove(existing)
                                 results.append(pred)
 
             except Exception as e:
                 print(f"[!] Digital Twin prediction error: {e}")
 
-        # ==========================================================
-        # ★ 最終ソートロジック (ここが重要)
-        # ==========================================================
-        # 優先順位:
-        # 1. 実際の障害 (CRITICAL / prob >= 0.9)
-        # 2. 予兆 (is_prediction=True)
-        # 3. 警告 (WARNING)
-        # 4. その他
-        
+        # 優先順位ソート
         results.sort(key=lambda x: (
             0 if (x.get("prob", 0) >= 0.9 and not x.get("is_prediction")) else # Real Incident Priority
             1 if x.get("is_prediction") else                                   # Prediction Priority
@@ -339,7 +310,6 @@ class LogicalRCA:
         joined = " ".join(safe_alerts)
         joined_lower = joined.lower()
 
-        # ルールベース判定 (変更なし)
         if ("Power Supply: Dual Loss" in joined) or ("Dual Loss" in joined) or ("Device Down" in joined) or ("Thermal Shutdown" in joined):
             return {"status": HealthStatus.CRITICAL, "reason": "Device down / dual PSU loss detected.", "impact_type": "Hardware/Physical"}
 
@@ -350,10 +320,7 @@ class LogicalRCA:
                 return {"status": HealthStatus.WARNING, "reason": "Single PSU failure (Redundant).", "impact_type": "Hardware/Redundancy"}
             return {"status": HealthStatus.CRITICAL, "reason": "Single PSU failure (Non-Redundant).", "impact_type": "Hardware/Physical"}
 
-        # ... (その他のルールベース判定は省略、既存同様) ...
-        # 簡易実装のためデフォルト値を返します
         if "critical" in joined_lower:
              return {"status": HealthStatus.CRITICAL, "reason": "Critical alert detected.", "impact_type": "Generic/Critical"}
         
-        # デフォルト
         return {"status": HealthStatus.WARNING, "reason": "Alert detected.", "impact_type": "Generic/Warning"}
