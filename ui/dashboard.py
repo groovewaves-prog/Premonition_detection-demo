@@ -21,6 +21,7 @@ class SiteStatus:
     mttr_estimate: str
 
 def build_site_statuses() -> List[SiteStatus]:
+    """全拠点の状態を構築"""
     sites = list_sites()
     statuses = []
     for site_id in sites:
@@ -46,6 +47,8 @@ def build_site_statuses() -> List[SiteStatus]:
             is_maintenance=is_maint,
             mttr_estimate=mttr
         ))
+    
+    # 優先度順にソート
     priority = {"停止": 0, "要対応": 1, "注意": 2, "正常": 3}
     statuses.sort(key=lambda s: (priority.get(s.status, 4), -s.alarm_count))
     return statuses
@@ -55,6 +58,7 @@ def render_site_status_board():
     st.subheader("🏢 拠点状態ボード")
     statuses = build_site_statuses()
     
+    # KPI表示
     cols = st.columns(4)
     cols[0].metric("🔴 障害発生", f"{sum(1 for s in statuses if s.status == '停止')}拠点")
     cols[1].metric("🟠 要対応", f"{sum(1 for s in statuses if s.status == '要対応')}拠点")
@@ -63,6 +67,7 @@ def render_site_status_board():
     
     st.divider()
     
+    # 2カラムのカード形式
     cols_per_row = 2
     for i in range(0, len(statuses), cols_per_row):
         row_cols = st.columns(cols_per_row)
@@ -75,18 +80,21 @@ def render_site_status_board():
                     if c2.button("詳細", key=f"board_det_{site.site_id}", type="primary"):
                         st.session_state.active_site = site.site_id
                         st.rerun()
-                    st.caption(f"📋 {site.scenario.split('. ', 1)[-1]}")
+                    
+                    scenario_display = site.scenario.split(". ", 1)[-1] if ". " in site.scenario else site.scenario
+                    st.caption(f"📋 {scenario_display}")
+                    
                     m1, m2, m3 = st.columns(3)
                     m1.metric("ステータス", site.status)
                     m2.metric("アラーム", f"{site.alarm_count}件")
                     m3.metric("MTTR", site.mttr_estimate)
 
 def render_triage_center():
-    """image_8a2426.png のトリアージUXを完全復元"""
+    """トリアージ画面の完全復元"""
     st.subheader("🚨 トリアージ・コマンドセンター")
     statuses = build_site_statuses()
     
-    # 停止または要対応の拠点のみを抽出
+    # 重大なインシデント（停止・要対応）が発生している拠点のみを表示
     alert_sites = [s for s in statuses if s.status in ["停止", "要対応"]]
     
     if not alert_sites:
@@ -94,11 +102,15 @@ def render_triage_center():
         return
 
     for site in alert_sites:
-        # image_8a2426.png の赤いバナー表示を再現
+        # 赤いバナー形式の警告表示を再現
         st.error(f"{site.display_name}: {site.status} (Alarm: {site.alarm_count})")
         
         # 「対応開始」ボタンをバナーの直下に配置
-        if st.button(f"対応開始 ({site.display_name[0]})", key=f"triage_btn_{site.site_id}"):
+        # ボタンのラベル形式 (A) 等も以前の仕様に準拠
+        site_label = site.display_name[0] if site.display_name else "?"
+        if st.button(f"対応開始 ({site_label})", key=f"triage_btn_{site.site_id}"):
             st.session_state.active_site = site.site_id
             st.rerun()
+        
+        # スペース調整
         st.markdown("<br>", unsafe_allow_html=True)
