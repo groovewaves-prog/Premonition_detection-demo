@@ -29,8 +29,10 @@ from .graph import render_topology_graph
 # =====================================================
 # 復元されたヘルパー関数
 # =====================================================
+def _hash_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
 def _pick_first(mapping: dict, keys: list, default: str = "") -> str:
-    """マッピングから最初の非空値を取得"""
     for k in keys:
         try:
             v = mapping.get(k)
@@ -39,29 +41,29 @@ def _pick_first(mapping: dict, keys: list, default: str = "") -> str:
     return default
 
 def _build_ci_context_for_chat(topology: dict, target_node_id: str) -> dict:
-    """チャット用のCIコンテキストを構築"""
     node = topology.get(target_node_id)
-    md = node.get('metadata', {}) if node and isinstance(node, dict) else (getattr(node, 'metadata', {}) if node else {})
+    md = node.metadata if node and hasattr(node, 'metadata') else (node.get('metadata', {}) if isinstance(node, dict) else {})
     ci = {
         "device_id": target_node_id or "",
-        "hostname": _pick_first(md, ["hostname", "host"], default=target_node_id or ""),
-        "vendor": _pick_first(md, ["vendor"], default=""),
-        "model": _pick_first(md, ["model"], default=""),
+        "hostname": _pick_first(md, ["hostname", "host", "name"], default=(target_node_id or "")),
+        "vendor": _pick_first(md, ["vendor", "manufacturer"], default=""),
+        "os": _pick_first(md, ["os", "platform"], default=""),
+        "model": _pick_first(md, ["model", "hw_model"], default=""),
+        "role": _pick_first(md, ["role", "type"], default=""),
     }
     try:
-        conf = load_config_by_id(target_node_id)
-        if conf: ci["config_excerpt"] = conf[:1000]
-    except: pass
+        conf = load_config_by_id(target_node_id) if target_node_id else ""
+        if conf: ci["config_excerpt"] = conf[:1500]
+    except Exception: pass
     return ci
 
 def run_diagnostic_simulation_no_llm(scenario: str, target_node) -> dict:
-    """診断シミュレーションの疑似実行"""
     dev_id = getattr(target_node, "id", "UNKNOWN") if target_node else "UNKNOWN"
-    lines = [f"[PROBE] scenario={scenario}", f"target={dev_id}", ""]
-    if "WAN" in scenario:
-        lines += ["show ip int brief", "Gi0/0/0 UP", "BGP State: Established"]
-    else:
-        lines += ["show system alarms", "No active alarms"]
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"[PROBE] ts={ts}", f"[PROBE] scenario={scenario}", f"[PROBE] target_device={dev_id}", ""]
+    if "WAN" in scenario: lines += ["show ip interface brief", "GigabitEthernet0/0 down down", "Neighbor 203.0.113.2 Idle"]
+    elif "FW" in scenario: lines += ["show chassis cluster status", "Redundancy group 0: degraded", "control link: down"]
+    else: lines += ["show system alarms", "No active alarms"]
     return {"status": "SUCCESS", "sanitized_log": "\n".join(lines), "device_id": dev_id}
 
 # =====================================================
@@ -71,22 +73,12 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     display_name = get_display_name(site_id)
     scenario = st.session_state.site_scenarios.get(site_id, "正常稼働")
     
-    # 復元されたヘッダーと「戻る」ボタン
+    # 1. 以前のヘッダー
     col_header = st.columns([4, 1])
     with col_header[0]:
         st.markdown(f"### 🛡️ AIOps インシデント・コックピット")
     with col_header[1]:
-        st.markdown('<span id="back-btn-marker"></span>', unsafe_allow_html=True)
-        st.markdown("""
-        <style>
-        #back-btn-marker + div button {
-            background-color: #d32f2f !important;
-            color: white !important;
-            font-weight: bold !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        if st.button("🔙 一覧に戻る", key="back_btn"):
+        if st.button("🔙 一覧に戻る", key="back_to_list"):
             st.session_state.active_site = None
             st.rerun()
 
@@ -94,8 +86,9 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     paths = get_paths(site_id)
     topology = load_topology(paths.topology_path)
     alarms = generate_alarms_for_scenario(topology, scenario)
+    status = get_status_from_alarms(scenario, alarms)
     
-    # 予兆シグナル注入
+    # 予兆注入
     injected = st.session_state.get("injected_weak_signal")
     if injected and injected["device_id"] in topology:
         for m in injected.get("messages", []):
@@ -105,11 +98,9 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     if engine_key not in st.session_state.logic_engines:
         st.session_state.logic_engines[engine_key] = LogicalRCA(topology)
     engine = st.session_state.logic_engines[engine_key]
-    
     results = engine.analyze(alarms) if alarms else []
-    status = get_status_from_alarms(scenario, alarms)
 
-    # 復元されたKPIメトリクス表示
+    # 2. KPIメトリクス
     st.markdown("---")
     k1, k2, k3 = st.columns(3)
     k1.metric("🚨 ステータス", f"{get_status_icon(status)} {status}")
@@ -117,34 +108,24 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     k3.metric("🎯 被疑箇所", f"{len([r for r in results if r.get('prob', 0) > 0.5])}件")
     st.markdown("---")
 
-    # =====================================================
-    # 根本原因と影響範囲の厳密な分離
-    # =====================================================
+    # 3. 根本原因と影響範囲の分離
     root_ids = {a.device_id for a in alarms if a.is_root_cause}
     ds_ids = {a.device_id for a in alarms if not a.is_root_cause}
-    
-    # 根本原因候補: アラームで根本原因判定されたもの、または予兆
-    rc_list = [r for r in results if r.get('is_prediction') or r['id'] in root_ids]
-    # 影響デバイス: 根本原因以外のアラームが出ているもの
+    rc_list = [r for r in results if r.get('is_prediction') or r['id'] in root_ids or r.get('prob', 0) > 0.8]
     ds_list = [r for r in results if r['id'] in ds_ids and r['id'] not in root_ids]
 
-    # 青帯バナーの復元
     if rc_list and ds_list:
         st.info(f"📍 **根本原因**: {rc_list[0]['id']} → 影響範囲: 配下 {len(ds_list)} 機器")
 
-    # Future Radar (予兆がある場合のみ表示)
+    # Future Radar (同僚案の予兆パネル)
     preds = [r for r in rc_list if r.get('is_prediction')]
     if preds:
         with st.container(border=True):
             st.markdown("##### 🔮 AIOps Future Radar (Precognition)")
             for p in preds:
-                st.warning(f"⚠️ **{p['id']}**: 深刻な障害へ進展する恐れがあります。急性期まで残り約{p.get('prediction_time_to_critical_min', 60)}分")
-                # 推奨アクションの即時提示
-                rec_actions = p.get("recommended_actions", [])
-                if rec_actions:
-                    st.markdown(f"👉 **まずやるべきこと:** {rec_actions[0]['title']} ({rec_actions[0]['effect']})")
+                st.warning(f"⚠️ **{p['id']}**: 急性期まで残り約 {p.get('prediction_time_to_critical_min', 60)} 分")
 
-    # 根本原因候補テーブルの描画
+    # 4. 根本原因候補テーブル
     if rc_list:
         st.markdown("#### 🎯 根本原因候補")
         df_rc = pd.DataFrame([{
@@ -157,79 +138,92 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             "_obj": x
         } for i, x in enumerate(rc_list)])
         
-        event = st.dataframe(
-            df_rc.drop(columns=["_obj"]), 
-            use_container_width=True, 
-            hide_index=True, 
-            selection_mode="single-row", 
-            on_select="rerun"
-        )
-        
+        event = st.dataframe(df_rc.drop(columns=["_obj"]), use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun")
         if event.selection and len(event.selection.rows) > 0:
             st.session_state.selected_candidate = df_rc.iloc[event.selection.rows[0]]["_obj"]
-        elif rc_list and not st.session_state.get("selected_candidate"):
+        elif not st.session_state.get("selected_candidate") and rc_list:
             st.session_state.selected_candidate = rc_list[0]
 
-    # 影響を受けている機器リストの復元
+    # 5. 上流復旧待ちリスト
     if ds_list:
         with st.expander(f"▼ 影響を受けている機器 ({len(ds_list)}台) - 上流復旧待ち", expanded=False):
-            st.dataframe(
-                pd.DataFrame([{"No": i+1, "デバイス": d['id'], "状態": "⚫ 応答なし", "備考": "上流復旧待ち"} for i, d in enumerate(ds_list)]), 
-                use_container_width=True, 
-                hide_index=True
-            )
+            st.dataframe(pd.DataFrame([{"No": i+1, "デバイス": d['id'], "状態": "⚫ 応答なし", "備考": "上流復旧待ち"} for i, d in enumerate(ds_list)]), use_container_width=True, hide_index=True)
 
-    # 以前の2カラムレイアウトの維持
+    # 6. 2カラムレイアウト
     col_l, col_r = st.columns([1.2, 1])
     
-    # === 左カラム: トポロジー & 診断 ===
     with col_l:
         st.subheader("🌐 Network Topology")
         st.graphviz_chart(render_topology_graph(topology, alarms, results), use_container_width=True)
-        
         st.markdown("---")
         st.subheader("🛠️ Auto-Diagnostics")
         if st.button("🚀 診断実行 (Run Diagnostics)", type="primary"):
-            with st.status("エージェントが診断ログを収集中..."):
+            with st.status("エージェント稼働中..."):
                 res = run_diagnostic_simulation_no_llm(scenario, st.session_state.get("selected_candidate"))
                 st.session_state.live_result = res
+                st.session_state.verification_result = verify_log_content(res.get('sanitized_log', ""))
             st.rerun()
-        
         if st.session_state.get("live_result"):
             res = st.session_state.live_result
-            st.markdown("#### 📄 Diagnostic Results")
-            st.code(res.get("sanitized_log"), language="text")
+            with st.container(border=True):
+                if st.session_state.get("verification_result"):
+                    v = st.session_state.verification_result
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Ping", v.get('ping_status'))
+                    c2.metric("Intf", v.get('interface_status'))
+                    c3.metric("HW", v.get('hardware_status'))
+                st.divider()
+                st.code(res.get("sanitized_log"), language="text")
 
-    # === 右カラム: AI分析 & チャット ===
     with col_r:
         st.subheader("📝 AI Analyst & Chat")
         cand = st.session_state.get("selected_candidate")
         if cand:
+            # ターゲット情報
             st.info(f"Target: **{cand['id']}**\n{cand.get('label')}")
             
             tab_rpt, tab_chat = st.tabs(["📝 レポート", "💬 チャット"])
-            with tab_rpt:
-                if st.button("📝 詳細レポートを作成"):
-                    with st.spinner("AIがトポロジーとログを分析中..."):
-                        # レポート生成ロジックを呼び出し
-                        time.sleep(1) # シミュレーション
-                        st.session_state.generated_report = f"### 分析レポート: {cand['id']}\nデジタルツインの推論に基づき、..."
-                
-                if st.session_state.generated_report:
-                    st.markdown(st.session_state.generated_report)
             
+            with tab_rpt:
+                # 復元された「詳細レポート」および「復旧プラン」ボタン
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    if st.button("📝 詳細レポートを作成 (Generate Report)", use_container_width=True):
+                        st.session_state.generated_report = ""
+                        placeholder = st.empty()
+                        target_conf = load_config_by_id(cand['id'])
+                        for chunk in generate_analyst_report_streaming(scenario, topology.get(cand['id']), {"id": cand['id']}, target_conf, "", api_key):
+                            st.session_state.generated_report += chunk
+                            placeholder.markdown(st.session_state.generated_report + "▌")
+                        placeholder.markdown(st.session_state.generated_report)
+                
+                with col_btn2:
+                    if st.button("✨ 復旧プランを作成 (Generate Fix)", use_container_width=True):
+                        st.session_state.remediation_plan = ""
+                        placeholder = st.empty()
+                        for chunk in generate_remediation_commands_streaming(scenario, st.session_state.generated_report or "", topology.get(cand['id']), api_key):
+                            st.session_state.remediation_plan += chunk
+                            placeholder.markdown(st.session_state.remediation_plan + "▌")
+                        placeholder.markdown(st.session_state.remediation_plan)
+
+                if st.session_state.generated_report:
+                    with st.container(height=400, border=True):
+                        st.markdown(st.session_state.generated_report)
+                
+                if st.session_state.get("remediation_plan"):
+                    st.success("復旧プランが作成されました")
+                    st.markdown(st.session_state.remediation_plan)
+
             with tab_chat:
                 if not st.session_state.get("chat_session") and api_key:
                     genai.configure(api_key=api_key)
                     st.session_state.chat_session = genai.GenerativeModel("gemma-3-12b-it").start_chat(history=[])
-                
                 chat_cont = st.container(height=300)
                 with chat_cont:
                     for msg in st.session_state.get("messages", []):
                         st.markdown(f"**{'🤖' if msg['role']=='assistant' else '👤'}**: {msg['content']}")
-                
                 prompt = st.chat_input("AIに質問...")
                 if prompt:
                     st.session_state.setdefault("messages", []).append({"role": "user", "content": prompt})
-                    # LLM呼び出し処理
+                    # LLM 処理は utils.llm_helper を使用して app.py と同様に実装可能
                     st.rerun()
