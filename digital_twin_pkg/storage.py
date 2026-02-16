@@ -1,3 +1,4 @@
+# digital_twin_pkg/storage.py
 import sqlite3
 import json
 import os
@@ -31,7 +32,6 @@ class StorageManager:
             "history": os.path.join(self.data_dir, "prediction_history.json"),
             "noise_counts": os.path.join(self.data_dir, "noise_counter.json"),
             "rule_stats": os.path.join(self.data_dir, "rule_stats.json"),
-            # metrics now in SQLite, but keeping key for consistency if needed
             "metric_store": os.path.join(self.data_dir, "metric_store.json"), 
             "outcomes": os.path.join(self.data_dir, "outcomes.json"),
             "incident_register": os.path.join(self.data_dir, "incident_register.json"),
@@ -116,7 +116,6 @@ class StorageManager:
                 ''')
                 
                 self._conn.commit()
-                # self._migrate_schema_if_needed() # omitted for brevity, v45.0 assumes fresh or compatible
         except Exception as e:
             logger.warning(f"SQLite init failed: {e}")
             self._conn = None
@@ -239,7 +238,7 @@ class StorageManager:
     def audit_insert_prepared(self, event, hash_before):
         if not self._conn: return False
         try:
-            details = json.dumps({
+            d = json.dumps({
                 "iso_time": event.get("iso_time"),
                 "apply_mode": event.get("apply_mode"),
                 "changes": event.get("changes"),
@@ -250,7 +249,7 @@ class StorageManager:
             with self._db_lock:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO audit_log (event_id, timestamp, event_type, actor, rule_pattern, details_json, status, rules_hash_before) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (event["event_id"], float(event["timestamp"]), event["event_type"], event["actor"], event["rule_pattern"], details, "prepared", hash_before)
+                    (event["event_id"], float(event["timestamp"]), event["event_type"], event["actor"], event["rule_pattern"], d, "prepared", hash_before)
                 )
                 self._conn.commit()
             return True
