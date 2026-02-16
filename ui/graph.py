@@ -1,4 +1,3 @@
-# ui/graph.py
 import graphviz
 from alarm_generator import NodeColor, Alarm
 from typing import List
@@ -21,15 +20,23 @@ def render_topology_graph(topology: dict, alarms: List[Alarm], analysis_results:
             info['max_severity'] = a.severity
     
     for node_id, node in topology.items():
-        node_type = getattr(node, 'type', node.get('type', 'UNKNOWN'))
-        metadata = getattr(node, 'metadata', node.get('metadata', {}))
+        # 安全な属性取得ロジック
+        if isinstance(node, dict):
+            node_type = node.get('type', 'UNKNOWN')
+            metadata = node.get('metadata', {})
+            redundancy_type = metadata.get('redundancy_type')
+        else:
+            node_type = getattr(node, 'type', 'UNKNOWN')
+            metadata = getattr(node, 'metadata', {})
+            redundancy_type = metadata.get('redundancy_type') if isinstance(metadata, dict) else getattr(metadata, 'redundancy_type', None)
         
         color = NodeColor.NORMAL
         penwidth = "1"
         fontcolor = "black"
         label = f"{node_id}\n({node_type})"
         
-        if metadata.get("redundancy_type"): label += f"\n[{metadata['redundancy_type']}]"
+        if redundancy_type:
+            label += f"\n[{redundancy_type}]"
         
         if node_id in alarm_map:
             info = alarm_map[node_id]
@@ -54,15 +61,31 @@ def render_topology_graph(topology: dict, alarms: List[Alarm], analysis_results:
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
     
     for node_id, node in topology.items():
-        parent_id = getattr(node, 'parent_id', node.get('parent_id'))
+        # 安全な親ID取得
+        if isinstance(node, dict):
+            parent_id = node.get('parent_id')
+            node_rg = node.get('redundancy_group')
+        else:
+            parent_id = getattr(node, 'parent_id', None)
+            node_rg = getattr(node, 'redundancy_group', None)
+
         if parent_id:
             graph.edge(parent_id, node_id)
             # Add redundancy links
             p_node = topology.get(parent_id)
-            rg = getattr(p_node, 'redundancy_group', p_node.get('redundancy_group')) if p_node else None
-            if rg:
-                for nid, n in topology.items():
-                    n_rg = getattr(n, 'redundancy_group', n.get('redundancy_group'))
-                    if n_rg == rg and nid != parent_id:
-                        graph.edge(nid, node_id)
+            if p_node:
+                if isinstance(p_node, dict):
+                    rg = p_node.get('redundancy_group')
+                else:
+                    rg = getattr(p_node, 'redundancy_group', None)
+                
+                if rg:
+                    for nid, n in topology.items():
+                        if isinstance(n, dict):
+                            n_rg = n.get('redundancy_group')
+                        else:
+                            n_rg = getattr(n, 'redundancy_group', None)
+                            
+                        if n_rg == rg and nid != parent_id:
+                            graph.edge(nid, node_id)
     return graph
