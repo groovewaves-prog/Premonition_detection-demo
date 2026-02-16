@@ -32,7 +32,7 @@ class DigitalTwinEngine:
         self.children_map = children_map or {}
         
         # Storage
-        self.storage = StorageManager(self.tenant_id, BASE_DIR) # ConfigのBASE_DIRを使用
+        self.storage = StorageManager(self.tenant_id, BASE_DIR)
         
         # Components
         self.tuner = AutoTuner(self)
@@ -60,10 +60,7 @@ class DigitalTwinEngine:
         self._ensure_model_loaded()
 
     def reload_all(self):
-        # 1. Load Rules (DB Priority)
         self._load_rules()
-        
-        # 2. Load State
         self.history = self.storage.load_json("history", [])
         self.outcomes = self.storage.load_json("outcomes", [])
         self.incident_register = self.storage.load_json("incident_register", [])
@@ -72,17 +69,11 @@ class DigitalTwinEngine:
         self.shadow_eval_state = self.storage.load_json("shadow_eval_state", {})
 
     def _sanitize_rule_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """内部管理用フィールドを除去してEscalationRuleに渡せる形にする"""
-        return {
-            k: v for k, v in data.items() 
-            if not k.startswith('_')  # _compiled_regex などを除去
-        }
+        return {k: v for k, v in data.items() if not k.startswith('_')}
 
     def _load_rules(self):
-        # DB SOT check
         loaded_from_db = False
         if self._rules_sot == "db":
-            # Attempt load from DB
             db_rules_json = self.storage.rule_config_get_all_json_strs()
             if db_rules_json:
                 try:
@@ -91,27 +82,21 @@ class DigitalTwinEngine:
                 except: pass
         
         if not loaded_from_db:
-            # File Fallback
             path = self.storage.paths["rules"]
             if not os.path.exists(path):
-                # Init Default
-                self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES] # Copy
-                # 保存時は辞書化
+                self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES]
                 self.storage.save_json_atomic("rules", [asdict(r) for r in self.rules])
             else:
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                    # 読み込み時にサニタイズ
                     self.rules = [EscalationRule(**self._sanitize_rule_data(item)) for item in data]
                 except Exception as e:
-                    logger.warning(f"Failed to load rules, fallback to default: {e}")
+                    logger.warning(f"Failed to load rules, fallback: {e}")
                     self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES]
             
-            # Seed DB if empty
             self.storage._seed_rule_config_from_rules_json([asdict(r) for r in self.rules])
 
-        # Setup metric rules
         self._metric_rules = [r for r in self.rules if (r.requires_trend or r.requires_volatility) and r.trend_metric_regex]
 
     def _ensure_model_loaded(self):
@@ -132,18 +117,16 @@ class DigitalTwinEngine:
                 self._rule_embeddings = {"vectors": embeddings, "indices": indices}
             self._model_loaded = True
         except:
-            self._model_loaded = True # Fail gracefully
+            self._model_loaded = True
 
     def _match_rule(self, alarm_text: str) -> Tuple[Optional[EscalationRule], float]:
         text_lower = alarm_text.lower()
-        # 1. Exact/Regex Match
         for rule in self.rules:
             if rule._compiled_regex and rule._compiled_regex.search(alarm_text):
                 return rule, 1.0
             if rule.pattern in text_lower:
                 return rule, 1.0
         
-        # 2. Semantic Match (BERT)
         if self._model and self._rule_embeddings:
             try:
                 query_vec = self._model.encode([alarm_text], convert_to_numpy=True)
@@ -155,7 +138,6 @@ class DigitalTwinEngine:
                 best_idx = np.argmax(cosine_sim)
                 best_score = float(cosine_sim[best_idx])
                 
-                # Check threshold (Use rule-specific or global)
                 rule_idx = self._rule_embeddings["indices"][best_idx]
                 rule = self.rules[rule_idx]
                 threshold = rule.embedding_threshold or 0.40
@@ -168,53 +150,36 @@ class DigitalTwinEngine:
 
     def _calculate_confidence(self, rule: EscalationRule, device_id: str, match_quality: float) -> float:
         attrs = self.topology.get(device_id, {})
-        # オブジェクト対応
-        if not isinstance(attrs, dict): 
-            # NetworkNodeなどのオブジェクトなら辞書化を試みるか、属性アクセスへ
-            try:
-                attrs = vars(attrs)
-            except:
-                attrs = {} # fallback
+        if not isinstance(attrs, dict):
+            try: attrs = vars(attrs)
+            except: attrs = {}
 
-        # Redundancy check
         rg = attrs.get('redundancy_group')
         has_redundancy = bool(rg)
-        
-        # SPOF check (Has children but no redundancy)
         children = self.children_map.get(device_id, [])
         is_spof = bool(children and not has_redundancy)
         
-        # Base confidence
         confidence = rule.base_confidence
-        
-        # Adjust by Match Quality (0.8 ~ 1.0 multiplier)
         confidence *= (0.8 + 0.2 * match_quality)
         
-        # Penalize for Redundancy
         if has_redundancy:
             confidence *= (1.0 - ROI_CONSERVATIVE_FACTOR * 0.2)
-            
-        # Boost for SPOF
         if is_spof:
-            confidence *= 1.1 # 10% boost
+            confidence *= 1.1
             
         return min(0.99, max(0.1, confidence))
 
     def predict(self, analysis_results: List[Dict], msg_map: Dict[str, List[str]], alarms: Optional[List] = None) -> List[Dict]:
         """
-        Main prediction logic using V45 architecture.
+        Main prediction logic.
         """
-        self.reload_all() # Ensure fresh rules/state
+        self.reload_all()
         
         predictions = []
-        
-        # 1. Filter Candidates (Exclude already critical devices)
         critical_ids = {
             r["id"] for r in analysis_results 
             if r.get("status") in ["RED", "CRITICAL"] or r.get("severity") == "CRITICAL" or float(r.get("prob", 0)) >= 0.85
         }
-        
-        # Warning IDs from analysis
         warning_ids = {
             r["id"] for r in analysis_results
             if 0.45 <= float(r.get("prob", 0)) <= 0.85
@@ -238,25 +203,20 @@ class DigitalTwinEngine:
                     matched_signals.append((rule, quality, msg))
 
             if not matched_signals:
-                # Try generic match
                 rule, quality = self._match_rule(messages[0])
                 if not rule: continue
                 matched_signals = [(rule, quality, messages[0])]
 
-            # Sort by quality
             matched_signals.sort(key=lambda x: x[1], reverse=True)
             primary_rule, primary_quality, primary_msg = matched_signals[0]
 
-            # Calculate Confidence
             confidence = self._calculate_confidence(primary_rule, dev_id, primary_quality)
             
-            # Multi-signal boost
             extra_signals = len(matched_signals) - 1
             if extra_signals > 0:
                 boost = min(extra_signals * multi_signal_boost, 0.20)
                 confidence = min(0.99, confidence + boost)
 
-            # Threshold Check (Use Persisted Thresholds if available)
             threshold = MIN_PREDICTION_CONFIDENCE
             if primary_rule.paging_threshold is not None:
                 threshold = primary_rule.paging_threshold
@@ -264,11 +224,11 @@ class DigitalTwinEngine:
             if confidence < threshold: 
                 continue
 
-            # Build Prediction Payload
             impact_count = 0
             if dev_id in self.children_map:
                 impact_count = len(self.children_map[dev_id])
-                
+            
+            # --- ここで「推奨アクション」をパッキングする ---
             pred = {
                 "id": dev_id,
                 "label": f"🔮 [予兆] {primary_rule.escalated_state}",
@@ -280,13 +240,15 @@ class DigitalTwinEngine:
                 "reason": f"Digital Twin Prediction: {primary_rule.time_to_critical_min}min to critical. Root: {primary_msg}",
                 "is_prediction": True,
                 "prediction_timeline": f"{primary_rule.time_to_critical_min}分後",
+                "prediction_time_to_critical_min": primary_rule.time_to_critical_min, # 数値として保持
                 "prediction_early_warning_hours": primary_rule.early_warning_hours,
                 "prediction_affected_count": impact_count,
                 "prediction_signal_count": len(matched_signals),
-                "prediction_confidence_factors": {"base": primary_rule.base_confidence}
+                "prediction_confidence_factors": {"base": primary_rule.base_confidence},
+                "recommended_actions": primary_rule.recommended_actions, # フロントエンドへ渡す
+                "runbook_url": primary_rule.runbook_url
             }
             
-            # Record History (V45 Storage)
             pid = str(uuid.uuid4())
             self.history.append({
                 "prediction_id": pid,
@@ -297,7 +259,6 @@ class DigitalTwinEngine:
                 "anchor_event_time": time.time(),
                 "raw_msg": primary_msg
             })
-            # Save history async or periodically (V45 saves in batch usually, here direct)
             self.storage.save_json_atomic("history", self.history)
             
             predictions.append(pred)
@@ -305,43 +266,32 @@ class DigitalTwinEngine:
             
         return predictions
 
-    # --- Tuning ---
     def generate_tuning_report(self, days: int = 30) -> Dict[str, Any]:
         return self.tuner.generate_report(days)
 
     def apply_tuning_proposals_if_auto(self, proposals: List[Dict]) -> Dict:
         applied = []
         skipped = []
-        
         with self.storage.global_lock(timeout_sec=30.0):
             for p in proposals:
                 rp = p.get("rule_pattern")
                 rec = p.get("apply_recommendation", {})
-                
-                # Check Auto Eligibility
                 if rec.get("apply_mode") != "auto":
                     skipped.append({"rule": rp, "reason": "not_auto"})
                     continue
-                
-                # Check DB SOT Integrity (Self-Healing Guard)
-                if self._rules_sot == "db":
-                    if not self.storage.rule_config_get_json_str(rp):
-                        skipped.append({"rule": rp, "reason": "db_integrity_fail"})
-                        continue
+                if self._rules_sot == "db" and not self.storage.rule_config_get_json_str(rp):
+                    skipped.append({"rule": rp, "reason": "db_integrity_fail"})
+                    continue
 
-                # Prepare values
                 prop = p.get("proposal", {})
                 pt = float(prop.get("paging_threshold", 0.0))
                 lt = float(prop.get("logging_threshold", 0.0))
-                
-                # Get Old (for Audit)
                 old_json_str = self.storage.rule_config_get_json_str(rp)
                 old_pt = None
                 if old_json_str:
                     try: old_pt = json.loads(old_json_str).get("paging_threshold")
                     except: pass
                 
-                # Apply (Upsert DB)
                 rj_str = old_json_str
                 if rj_str:
                     d = json.loads(rj_str)
@@ -350,49 +300,30 @@ class DigitalTwinEngine:
                     rj_str = json.dumps(d, ensure_ascii=False)
                 
                 success = self.storage.rule_config_upsert(rp, pt, lt, rj_str)
-                
-                # Audit
                 if success:
                     event = {
-                        "event_id": str(uuid.uuid4()),
-                        "timestamp": time.time(),
-                        "event_type": "threshold_apply",
-                        "actor": "agent:auto",
-                        "rule_pattern": rp,
-                        "apply_mode": "auto",
-                        "changes": {
-                            "paging": {"old": old_pt, "new": pt},
-                            "logging": {"new": lt}
-                        },
+                        "event_id": str(uuid.uuid4()), "timestamp": time.time(), "event_type": "threshold_apply",
+                        "actor": "agent:auto", "rule_pattern": rp, "apply_mode": "auto",
+                        "changes": {"paging": {"old": old_pt, "new": pt}},
                         "evidence": AuditBuilder.build_evidence(self.shadow_eval_state, p)
                     }
                     self.storage.audit_log_generic(event)
                     applied.append({"rule": rp, "paging": pt})
                 else:
                     skipped.append({"rule": rp, "reason": "db_write_fail"})
-
         return {"applied": applied, "skipped": skipped}
 
-    # --- Self Healing ---
     def repair_db_from_rules_json(self) -> bool:
-        """
-        Emergency: Reload rules.json and force-update DB config.
-        """
-        logger.info("Starting Self-Healing: Repair DB from rules.json")
         try:
             path = self.storage.paths["rules"]
             if not os.path.exists(path): return False
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # 読み込み時にもサニタイズしてDBへ
             sanitized = [self._sanitize_rule_data(item) for item in data]
             self.storage._seed_rule_config_from_rules_json(sanitized)
             return True
-        except Exception as e:
-            logger.error(f"Self-healing failed: {e}")
-            return False
+        except Exception: return False
             
-    # --- Others ---
     def register_outcome(self, pid, is_inc, act):
         rec = {"prediction_id": pid, "timestamp": time.time(), "is_incident": is_inc, "user_action": act}
         self.outcomes.append(rec)
