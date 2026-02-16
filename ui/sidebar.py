@@ -164,7 +164,7 @@ def _render_weak_signal_injection():
             
             elif "Microburst" in scenario_type:
                 drops = degradation_level * 200
-                # ルール "memory_leak" や "generic_error" に近い挙動
+                # ルール "microburst" にヒットさせる
                 log_messages.append(
                     f"%HARDWARE-3-ASIC_ERROR: Input queue drops detected (Count: {drops}). Burst traffic."
                 )
@@ -180,6 +180,7 @@ def _render_weak_signal_injection():
             
             elif "Route" in scenario_type:
                 updates = degradation_level * 500
+                # ルール "route_instability" にヒットさせる
                 log_messages.append(
                     f"BGP-5-ADJCHANGE: Route updates {updates}/min. Stability warning."
                 )
