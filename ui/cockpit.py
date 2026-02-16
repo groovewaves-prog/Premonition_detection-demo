@@ -23,7 +23,11 @@ from network_ops import (
     RemediationEnvironment,
     sanitize_output
 )
-from utils.helpers import get_status_from_alarms, get_status_icon, load_config_by_id, get_rate_limiter, generate_content_with_retry
+
+# === 修正箇所: インポート先を適切に分離 ===
+from utils.helpers import get_status_from_alarms, get_status_icon, load_config_by_id
+from utils.llm_helper import get_rate_limiter, generate_content_with_retry
+
 from verifier import verify_log_content
 from .graph import render_topology_graph
 
