@@ -73,7 +73,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     display_name = get_display_name(site_id)
     scenario = st.session_state.site_scenarios.get(site_id, "正常稼働")
     
-    # 1. 以前のヘッダー
+    # 1. ヘッダー
     col_header = st.columns([4, 1])
     with col_header[0]:
         st.markdown(f"### 🛡️ AIOps インシデント・コックピット")
@@ -108,7 +108,47 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     k3.metric("🎯 被疑箇所", f"{len([r for r in results if r.get('prob', 0) > 0.5])}件")
     st.markdown("---")
 
-    # 3. 根本原因と影響範囲の分離
+    # =====================================================
+    # 🔮 【新規追加】予兆判断を助けるUI (Future Radar)
+    # =====================================================
+    preds = [r for r in results if r.get('is_prediction')]
+    if preds:
+        st.markdown("### 🔮 AIOps Future Radar (Precognition)")
+        for p in preds:
+            with st.container():
+                # 「いつ・どうする・影響範囲」を現場の言葉で表示
+                st.markdown(f"""
+                <div style="border: 2px solid #E1BEE7; border-left: 10px solid #9C27B0; background-color: #F3E5F5; padding: 15px; border-radius: 8px; margin-bottom: 10px;">
+                    <div style="display:flex; justify-content:space-between;">
+                        <span style="font-weight:bold; color:#4A148C; font-size:1.1em;">📍 {p['id']} : {p.get('label', '').replace('🔮 [予兆] ', '')}</span>
+                        <span style="color:#880E4F; font-weight:bold;">確信度 {p.get('prob', 0)*100:.0f}%</span>
+                    </div>
+                    <div style="margin-top:10px; display:grid; grid-template-columns: 1fr 1.2fr 1fr; gap:15px;">
+                        <div style="background:white; padding:8px; border-radius:4px;">
+                            <small style="color:#666;">急性期(Critical)まで</small><br><b>あと約 {p.get('prediction_time_to_critical_min', 0)} 分</b>
+                        </div>
+                        <div style="background:white; padding:8px; border-radius:4px;">
+                            <small style="color:#666;">影響の広がり</small><br>配下 <b>{p.get('prediction_affected_count', 0)} 台</b> のリスク
+                        </div>
+                        <div style="background:white; padding:8px; border-radius:4px;">
+                            <small style="color:#666;">早期捕捉</small><br><b>{p.get('prediction_early_warning_hours', 0)}時間前</b> に検知
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # 推奨アクション (Primary Actions)
+                rec_actions = p.get("recommended_actions", [])
+                if rec_actions:
+                    cols_act = st.columns(len(rec_actions))
+                    for idx, act in enumerate(rec_actions):
+                        with cols_act[idx]:
+                            st.info(f"👉 **{act['title']}**\n\n{act['effect']}")
+        st.markdown("---")
+
+    # =====================================================
+    # 根本原因と影響範囲の分離表示
+    # =====================================================
     root_ids = {a.device_id for a in alarms if a.is_root_cause}
     ds_ids = {a.device_id for a in alarms if not a.is_root_cause}
     rc_list = [r for r in results if r.get('is_prediction') or r['id'] in root_ids or r.get('prob', 0) > 0.8]
@@ -117,23 +157,13 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     if rc_list and ds_list:
         st.info(f"📍 **根本原因**: {rc_list[0]['id']} → 影響範囲: 配下 {len(ds_list)} 機器")
 
-    # Future Radar (同僚案の予兆パネル)
-    preds = [r for r in rc_list if r.get('is_prediction')]
-    if preds:
-        with st.container(border=True):
-            st.markdown("##### 🔮 AIOps Future Radar (Precognition)")
-            for p in preds:
-                st.warning(f"⚠️ **{p['id']}**: 急性期まで残り約 {p.get('prediction_time_to_critical_min', 60)} 分")
-
-    # 4. 根本原因候補テーブル
+    # 根本原因候補テーブル
     if rc_list:
         st.markdown("#### 🎯 根本原因候補")
         df_rc = pd.DataFrame([{
             "順位": i+1,
             "ステータス": "🔮 予兆" if x.get('is_prediction') else "🔴 危険 (根本原因)" if x['prob']>=0.9 else "🟡 警告",
-            "デバイス": x['id'],
-            "原因": x.get('label'),
-            "確信度": f"{x['prob']*100:.0f}%",
+            "デバイス": x['id'], "原因": x.get('label'), "確信度": f"{x['prob']*100:.0f}%",
             "推奨アクション": "🚀 自動修復が可能" if x['prob']>=0.8 else "🔍 詳細調査",
             "_obj": x
         } for i, x in enumerate(rc_list)])
@@ -144,12 +174,12 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         elif not st.session_state.get("selected_candidate") and rc_list:
             st.session_state.selected_candidate = rc_list[0]
 
-    # 5. 上流復旧待ちリスト
+    # 上流復旧待ちリスト
     if ds_list:
         with st.expander(f"▼ 影響を受けている機器 ({len(ds_list)}台) - 上流復旧待ち", expanded=False):
             st.dataframe(pd.DataFrame([{"No": i+1, "デバイス": d['id'], "状態": "⚫ 応答なし", "備考": "上流復旧待ち"} for i, d in enumerate(ds_list)]), use_container_width=True, hide_index=True)
 
-    # 6. 2カラムレイアウト
+    # 3. 2カラムレイアウト (トポロジー / 分析)
     col_l, col_r = st.columns([1.2, 1])
     
     with col_l:
@@ -179,13 +209,10 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         st.subheader("📝 AI Analyst & Chat")
         cand = st.session_state.get("selected_candidate")
         if cand:
-            # ターゲット情報
             st.info(f"Target: **{cand['id']}**\n{cand.get('label')}")
-            
             tab_rpt, tab_chat = st.tabs(["📝 レポート", "💬 チャット"])
             
             with tab_rpt:
-                # 復元された「詳細レポート」および「復旧プラン」ボタン
                 col_btn1, col_btn2 = st.columns(2)
                 with col_btn1:
                     if st.button("📝 詳細レポートを作成 (Generate Report)", use_container_width=True):
@@ -199,17 +226,18 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 
                 with col_btn2:
                     if st.button("✨ 復旧プランを作成 (Generate Fix)", use_container_width=True):
-                        st.session_state.remediation_plan = ""
-                        placeholder = st.empty()
-                        for chunk in generate_remediation_commands_streaming(scenario, st.session_state.generated_report or "", topology.get(cand['id']), api_key):
-                            st.session_state.remediation_plan += chunk
-                            placeholder.markdown(st.session_state.remediation_plan + "▌")
-                        placeholder.markdown(st.session_state.remediation_plan)
+                        if not st.session_state.get("generated_report"):
+                            st.warning("先に「詳細レポート」を作成してください。")
+                        else:
+                            st.session_state.remediation_plan = ""
+                            placeholder = st.empty()
+                            for chunk in generate_remediation_commands_streaming(scenario, st.session_state.generated_report, topology.get(cand['id']), api_key):
+                                st.session_state.remediation_plan += chunk
+                                placeholder.markdown(st.session_state.remediation_plan + "▌")
+                            placeholder.markdown(st.session_state.remediation_plan)
 
                 if st.session_state.generated_report:
-                    with st.container(height=400, border=True):
-                        st.markdown(st.session_state.generated_report)
-                
+                    with st.container(height=400, border=True): st.markdown(st.session_state.generated_report)
                 if st.session_state.get("remediation_plan"):
                     st.success("復旧プランが作成されました")
                     st.markdown(st.session_state.remediation_plan)
@@ -225,5 +253,4 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 prompt = st.chat_input("AIに質問...")
                 if prompt:
                     st.session_state.setdefault("messages", []).append({"role": "user", "content": prompt})
-                    # LLM 処理は utils.llm_helper を使用して app.py と同様に実装可能
                     st.rerun()
