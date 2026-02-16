@@ -1,9 +1,9 @@
-# digital_twin_pkg/engine.py
 import logging
 import time
 import json
 import uuid
 import re
+import os
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import asdict
 
@@ -71,6 +71,13 @@ class DigitalTwinEngine:
         self.evaluation_state = self.storage.load_json("evaluation_state", {})
         self.shadow_eval_state = self.storage.load_json("shadow_eval_state", {})
 
+    def _sanitize_rule_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """内部管理用フィールドを除去してEscalationRuleに渡せる形にする"""
+        return {
+            k: v for k, v in data.items() 
+            if not k.startswith('_')  # _compiled_regex などを除去
+        }
+
     def _load_rules(self):
         # DB SOT check
         loaded_from_db = False
@@ -79,7 +86,7 @@ class DigitalTwinEngine:
             db_rules_json = self.storage.rule_config_get_all_json_strs()
             if db_rules_json:
                 try:
-                    self.rules = [EscalationRule(**json.loads(s)) for s in db_rules_json]
+                    self.rules = [EscalationRule(**self._sanitize_rule_data(json.loads(s))) for s in db_rules_json]
                     loaded_from_db = True
                 except: pass
         
@@ -89,13 +96,16 @@ class DigitalTwinEngine:
             if not os.path.exists(path):
                 # Init Default
                 self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES] # Copy
+                # 保存時は辞書化
                 self.storage.save_json_atomic("rules", [asdict(r) for r in self.rules])
             else:
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                    self.rules = [EscalationRule(**item) for item in data]
-                except:
+                    # 読み込み時にサニタイズ
+                    self.rules = [EscalationRule(**self._sanitize_rule_data(item)) for item in data]
+                except Exception as e:
+                    logger.warning(f"Failed to load rules, fallback to default: {e}")
                     self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES]
             
             # Seed DB if empty
@@ -158,8 +168,14 @@ class DigitalTwinEngine:
 
     def _calculate_confidence(self, rule: EscalationRule, device_id: str, match_quality: float) -> float:
         attrs = self.topology.get(device_id, {})
-        if not isinstance(attrs, dict): attrs = vars(attrs) # Handle dataclass
-        
+        # オブジェクト対応
+        if not isinstance(attrs, dict): 
+            # NetworkNodeなどのオブジェクトなら辞書化を試みるか、属性アクセスへ
+            try:
+                attrs = vars(attrs)
+            except:
+                attrs = {} # fallback
+
         # Redundancy check
         rg = attrs.get('redundancy_group')
         has_redundancy = bool(rg)
@@ -310,12 +326,6 @@ class DigitalTwinEngine:
                 # Check DB SOT Integrity (Self-Healing Guard)
                 if self._rules_sot == "db":
                     if not self.storage.rule_config_get_json_str(rp):
-                        # Block application if DB rule definition is missing
-                        self.storage.audit_log_generic({
-                            "event_type": "threshold_apply_rejected",
-                            "rule_pattern": rp,
-                            "details": {"reason": "missing_rule_json_in_db"}
-                        })
                         skipped.append({"rule": rp, "reason": "db_integrity_fail"})
                         continue
 
@@ -374,8 +384,9 @@ class DigitalTwinEngine:
             if not os.path.exists(path): return False
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # Seed overwrites DB
-            self.storage._seed_rule_config_from_rules_json(data)
+            # 読み込み時にもサニタイズしてDBへ
+            sanitized = [self._sanitize_rule_data(item) for item in data]
+            self.storage._seed_rule_config_from_rules_json(sanitized)
             return True
         except Exception as e:
             logger.error(f"Self-healing failed: {e}")
