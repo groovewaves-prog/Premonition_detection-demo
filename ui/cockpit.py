@@ -110,7 +110,8 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         st.session_state.logic_engines[engine_key] = LogicalRCA(topology)
     engine = st.session_state.logic_engines[engine_key]
     
-    analysis_results = engine.analyze(alarms) if alarms else []
+    # ★ 修正箇所: 変数名を results に統一
+    results = engine.analyze(alarms) if alarms else []
     if not results: results = [{"id": "SYSTEM", "label": "正常稼働", "prob": 0.0, "type": "Normal"}]
 
     # --- KPI & Precognition ---
@@ -131,7 +132,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     # --- Future Radar (Precognition) ---
     if preds:
         st.markdown("### 🔮 AIOps Future Radar")
-        st.caption("AIが予測する未来の障害イベント。")
+        st.caption("AIが予測する未来の障害イベント。クリックで詳細分析へジャンプします。")
         
         st.markdown("""
         <style>
@@ -243,7 +244,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             </div>
             """, unsafe_allow_html=True)
             
-            # ★ 2. 推奨アクション (Primary Actions) - AIに聞く前に表示
+            # 2. 推奨アクション (Primary Actions) - AIに聞く前に表示
             rec_actions = sel_cand.get("recommended_actions", [])
             if rec_actions and sel_cand.get('is_prediction'):
                 st.markdown("#### ⚡ 推奨アクション (Primary Actions)")
@@ -262,7 +263,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     if sel_cand.get('reason'):
                         st.info(sel_cand.get('reason'))
                     
-                    # Action Checklist (Memory only for demo)
                     st.checkbox("ログを確認した", key=f"chk_log_{sel_cand['id']}")
                     st.checkbox("影響範囲を確認した", key=f"chk_imp_{sel_cand['id']}")
 
@@ -298,7 +298,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 c_ok, c_fp, c_mute = st.columns(3)
                 if c_ok.button("解決 (Resolved)", type="primary", use_container_width=True):
                     st.toast(f"インシデント {sel_cand['id']} を解決済として記録しました。")
-                    # In real app: save to DB
                 if c_fp.button("誤検知 (FP)", use_container_width=True):
                     st.toast("誤検知として報告しました。学習データに反映されます。")
                 if c_mute.button("静観 (Mute)", use_container_width=True):
@@ -309,14 +308,12 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     genai.configure(api_key=api_key)
                     st.session_state.chat_session = genai.GenerativeModel("gemma-3-12b-it").start_chat(history=[])
                 
-                # Chat History
                 chat_cont = st.container(height=300)
                 with chat_cont:
                     for msg in st.session_state.messages[-10:]:
                         icon = "🤖" if msg["role"] == "assistant" else "👤"
                         st.markdown(f"**{icon}** {msg['content']}")
 
-                # Input
                 prompt = st.chat_input("AIエージェントに質問...")
                 if prompt:
                     st.session_state.messages.append({"role": "user", "content": prompt})
