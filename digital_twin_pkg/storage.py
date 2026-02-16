@@ -1,4 +1,3 @@
-# digital_twin_pkg/storage.py
 import sqlite3
 import json
 import os
@@ -22,7 +21,6 @@ class StorageManager:
     """
     def __init__(self, tenant_id: str, base_data_dir: str):
         self.tenant_id = tenant_id
-        # Ensure directory exists
         self.data_dir = os.path.join(base_data_dir, self.tenant_id)
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir, mode=0o700, exist_ok=True)
@@ -67,7 +65,6 @@ class StorageManager:
                 break
             except FileExistsError:
                 try:
-                    # Stale lock cleanup
                     if time.time() - os.path.getmtime(lock_path) > LOCK_TTL_SEC:
                         shutil.rmtree(lock_path, ignore_errors=True)
                         continue
@@ -94,7 +91,6 @@ class StorageManager:
                 self._conn.execute('''CREATE TABLE IF NOT EXISTS metrics (device_id TEXT, rule_pattern TEXT, metric_name TEXT, timestamp REAL, value REAL)''')
                 self._conn.execute('CREATE INDEX IF NOT EXISTS idx_metrics_query ON metrics (device_id, rule_pattern, metric_name, timestamp)')
                 
-                # Audit Log
                 self._conn.execute('''
                     CREATE TABLE IF NOT EXISTS audit_log (
                         event_id TEXT PRIMARY KEY, timestamp REAL, event_type TEXT, 
@@ -104,7 +100,6 @@ class StorageManager:
                     )
                 ''')
                 
-                # Canonical Rule Config (DB Source of Truth)
                 self._conn.execute('''
                     CREATE TABLE IF NOT EXISTS rule_config (
                         rule_pattern TEXT PRIMARY KEY, 
@@ -114,7 +109,6 @@ class StorageManager:
                         updated_at REAL
                     )
                 ''')
-                
                 self._conn.commit()
         except Exception as e:
             logger.warning(f"SQLite init failed: {e}")
@@ -143,7 +137,6 @@ class StorageManager:
 
     # --- JSON Atomic File Ops ---
     def load_json(self, key: str, default: Any = None) -> Any:
-        # Prefer SQLite for specific state keys
         if key in ["evaluation_state"] and self._conn:
             val = self.load_state_sqlite(key, None)
             if val is not None: return val
@@ -201,7 +194,7 @@ class StorageManager:
                 self._conn.commit()
         except Exception: pass
 
-    # --- Rule Config DB (Source of Truth) ---
+    # --- Rule Config DB ---
     def rule_config_upsert(self, rp, pt, lt, rule_json_str):
         if not self._conn: return False
         try:
@@ -276,7 +269,6 @@ class StorageManager:
         except Exception: return False
         
     def audit_log_generic(self, event: Dict[str, Any]):
-        """Simple insert for generic events (export failed etc)"""
         if not self._conn: return
         try:
             details = json.dumps(event.get("details", {}), ensure_ascii=False)
