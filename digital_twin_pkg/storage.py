@@ -1,4 +1,3 @@
-# digital_twin_pkg/storage.py
 import sqlite3
 import json
 import os
@@ -22,7 +21,6 @@ class StorageManager:
     """
     def __init__(self, tenant_id: str, base_data_dir: str):
         self.tenant_id = tenant_id
-        # Ensure directory exists
         self.data_dir = os.path.join(base_data_dir, self.tenant_id)
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir, mode=0o700, exist_ok=True)
@@ -196,7 +194,7 @@ class StorageManager:
                 self._conn.commit()
         except Exception: pass
 
-    # --- Rule Config DB (Source of Truth) ---
+    # --- Rule Config DB ---
     def rule_config_upsert(self, rp, pt, lt, rule_json_str):
         if not self._conn: return False
         try:
