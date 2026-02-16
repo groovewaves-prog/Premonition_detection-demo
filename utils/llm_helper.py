@@ -1,4 +1,3 @@
-# utils/llm_helper.py
 import time
 import os
 import streamlit as st
@@ -27,31 +26,3 @@ def generate_content_with_retry(model, prompt, stream=True, retries=3):
             if i == retries - 1: raise
             time.sleep(2 * (i + 1))
     return None
-
-def build_ci_context_for_chat(topology: dict, target_node_id: str) -> dict:
-    from .helpers import load_config_by_id
-    
-    node = topology.get(target_node_id) if target_node_id else None
-    md = {}
-    if node:
-        md = node.metadata if hasattr(node, 'metadata') else node.get('metadata', {})
-    
-    def _pick(keys, default=""):
-        for k in keys:
-            v = md.get(k)
-            if v: return str(v).strip()
-        return default
-
-    ci = {
-        "device_id": target_node_id or "",
-        "hostname": _pick(["hostname", "host", "name"], default=(target_node_id or "")),
-        "vendor": _pick(["vendor", "manufacturer"], default=""),
-        "os": _pick(["os", "platform"], default=""),
-        "model": _pick(["model", "hw_model"], default=""),
-        "role": _pick(["role", "type"], default=""),
-        "site": _pick(["site", "location"], default=""),
-    }
-    
-    conf = load_config_by_id(target_node_id)
-    if conf: ci["config_excerpt"] = conf[:1500]
-    return ci
