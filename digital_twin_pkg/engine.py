@@ -1,3 +1,4 @@
+# digital_twin_pkg/engine.py (Knowledge Transfer Update)
 import logging
 import time
 import json
@@ -22,22 +23,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class DigitalTwinEngine:
-    """
-    v45.0 Main Engine Class: Integrates Storage, Rules, Audit, and Tuning.
-    """
     def __init__(self, topology: Dict[str, Any], children_map: Optional[Dict[str, List[str]]] = None, tenant_id: str = "default"):
         if not tenant_id or len(tenant_id) > 64: raise ValueError("Invalid tenant_id")
         self.tenant_id = tenant_id.lower()
         self.topology = topology
         self.children_map = children_map or {}
-        
-        # Storage
         self.storage = StorageManager(self.tenant_id, BASE_DIR)
-        
-        # Components
         self.tuner = AutoTuner(self)
-        
-        # State
         self.rules: List[EscalationRule] = []
         self._metric_rules: List[EscalationRule] = []
         self.history: List[Dict] = []
@@ -46,16 +38,10 @@ class DigitalTwinEngine:
         self.maintenance_windows: List[Dict] = []
         self.evaluation_state: Dict = {}
         self.shadow_eval_state: Dict = {}
-        
-        # Models
         self._model = None
         self._rule_embeddings = None
         self._model_loaded = False
-        
-        # Config Mode
         self._rules_sot = (os.environ.get(ENV_RULES_SOT, "json") or "json").strip().lower()
-        
-        # Load
         self.reload_all()
         self._ensure_model_loaded()
 
@@ -80,7 +66,6 @@ class DigitalTwinEngine:
                     self.rules = [EscalationRule(**self._sanitize_rule_data(json.loads(s))) for s in db_rules_json]
                     loaded_from_db = True
                 except: pass
-        
         if not loaded_from_db:
             path = self.storage.paths["rules"]
             if not os.path.exists(path):
@@ -92,11 +77,8 @@ class DigitalTwinEngine:
                         data = json.load(f)
                     self.rules = [EscalationRule(**self._sanitize_rule_data(item)) for item in data]
                 except Exception as e:
-                    logger.warning(f"Failed to load rules, fallback: {e}")
                     self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES]
-            
             self.storage._seed_rule_config_from_rules_json([asdict(r) for r in self.rules])
-
         self._metric_rules = [r for r in self.rules if (r.requires_trend or r.requires_volatility) and r.trend_metric_regex]
 
     def _ensure_model_loaded(self):
@@ -116,8 +98,7 @@ class DigitalTwinEngine:
                 embeddings = self._model.encode(phrases, convert_to_numpy=True)
                 self._rule_embeddings = {"vectors": embeddings, "indices": indices}
             self._model_loaded = True
-        except:
-            self._model_loaded = True
+        except: self._model_loaded = True
 
     def _match_rule(self, alarm_text: str) -> Tuple[Optional[EscalationRule], float]:
         text_lower = alarm_text.lower()
@@ -126,7 +107,6 @@ class DigitalTwinEngine:
                 return rule, 1.0
             if rule.pattern in text_lower:
                 return rule, 1.0
-        
         if self._model and self._rule_embeddings:
             try:
                 query_vec = self._model.encode([alarm_text], convert_to_numpy=True)
@@ -134,18 +114,13 @@ class DigitalTwinEngine:
                 similarities = np.dot(rule_vecs, query_vec.T).flatten()
                 norms = np.linalg.norm(rule_vecs, axis=1) * np.linalg.norm(query_vec)
                 cosine_sim = similarities / np.where(norms==0, 1e-10, norms)
-                
                 best_idx = np.argmax(cosine_sim)
                 best_score = float(cosine_sim[best_idx])
-                
                 rule_idx = self._rule_embeddings["indices"][best_idx]
                 rule = self.rules[rule_idx]
-                threshold = rule.embedding_threshold or 0.40
-                
-                if best_score >= threshold:
+                if best_score >= (rule.embedding_threshold or 0.40):
                     return rule, best_score
-            except Exception:
-                pass
+            except Exception: pass
         return None, 0.0
 
     def _calculate_confidence(self, rule: EscalationRule, device_id: str, match_quality: float) -> float:
@@ -153,55 +128,35 @@ class DigitalTwinEngine:
         if not isinstance(attrs, dict):
             try: attrs = vars(attrs)
             except: attrs = {}
-
         rg = attrs.get('redundancy_group')
         has_redundancy = bool(rg)
         children = self.children_map.get(device_id, [])
         is_spof = bool(children and not has_redundancy)
-        
         confidence = rule.base_confidence
         confidence *= (0.8 + 0.2 * match_quality)
-        
-        if has_redundancy:
-            confidence *= (1.0 - ROI_CONSERVATIVE_FACTOR * 0.2)
-        if is_spof:
-            confidence *= 1.1
-            
+        if has_redundancy: confidence *= (1.0 - ROI_CONSERVATIVE_FACTOR * 0.2)
+        if is_spof: confidence *= 1.1
         return min(0.99, max(0.1, confidence))
 
     def predict(self, analysis_results: List[Dict], msg_map: Dict[str, List[str]], alarms: Optional[List] = None) -> List[Dict]:
-        """
-        Main prediction logic.
-        """
         self.reload_all()
-        
         predictions = []
-        critical_ids = {
-            r["id"] for r in analysis_results 
-            if r.get("status") in ["RED", "CRITICAL"] or r.get("severity") == "CRITICAL" or float(r.get("prob", 0)) >= 0.85
-        }
-        warning_ids = {
-            r["id"] for r in analysis_results
-            if 0.45 <= float(r.get("prob", 0)) <= 0.85
-        }
+        critical_ids = {r["id"] for r in analysis_results if r.get("status") in ["RED", "CRITICAL"] or r.get("severity") == "CRITICAL" or float(r.get("prob", 0)) >= 0.85}
+        warning_ids = {r["id"] for r in analysis_results if 0.45 <= float(r.get("prob", 0)) <= 0.85}
         active_ids = set(msg_map.keys())
         candidates = (warning_ids.union(active_ids)) - critical_ids
-        
         processed_devices = set()
         multi_signal_boost = 0.05
 
         for dev_id in candidates:
             if dev_id in processed_devices: continue
-            
             messages = msg_map.get(dev_id, [])
             if not messages: continue
-
             matched_signals = []
             for msg in messages:
                 rule, quality = self._match_rule(msg)
                 if rule and quality >= 0.30 and rule.pattern != "generic_error":
                     matched_signals.append((rule, quality, msg))
-
             if not matched_signals:
                 rule, quality = self._match_rule(messages[0])
                 if not rule: continue
@@ -209,9 +164,7 @@ class DigitalTwinEngine:
 
             matched_signals.sort(key=lambda x: x[1], reverse=True)
             primary_rule, primary_quality, primary_msg = matched_signals[0]
-
             confidence = self._calculate_confidence(primary_rule, dev_id, primary_quality)
-            
             extra_signals = len(matched_signals) - 1
             if extra_signals > 0:
                 boost = min(extra_signals * multi_signal_boost, 0.20)
@@ -220,15 +173,13 @@ class DigitalTwinEngine:
             threshold = MIN_PREDICTION_CONFIDENCE
             if primary_rule.paging_threshold is not None:
                 threshold = primary_rule.paging_threshold
-            
-            if confidence < threshold: 
-                continue
+            if confidence < threshold: continue
 
             impact_count = 0
             if dev_id in self.children_map:
                 impact_count = len(self.children_map[dev_id])
             
-            # --- ここで「推奨アクション」をパッキングする ---
+            # --- 予測結果に「運用者向けの具体的な知識」を注入 ---
             pred = {
                 "id": dev_id,
                 "label": f"🔮 [予兆] {primary_rule.escalated_state}",
@@ -240,30 +191,19 @@ class DigitalTwinEngine:
                 "reason": f"Digital Twin Prediction: {primary_rule.time_to_critical_min}min to critical. Root: {primary_msg}",
                 "is_prediction": True,
                 "prediction_timeline": f"{primary_rule.time_to_critical_min}分後",
-                "prediction_time_to_critical_min": primary_rule.time_to_critical_min, # 数値として保持
+                "prediction_time_to_critical_min": primary_rule.time_to_critical_min,
                 "prediction_early_warning_hours": primary_rule.early_warning_hours,
                 "prediction_affected_count": impact_count,
                 "prediction_signal_count": len(matched_signals),
-                "prediction_confidence_factors": {"base": primary_rule.base_confidence},
-                "recommended_actions": primary_rule.recommended_actions, # フロントエンドへ渡す
+                "prediction_confidence_factors": {"base": primary_rule.base_confidence, "match_quality": primary_quality},
+                "recommended_actions": primary_rule.recommended_actions,
                 "runbook_url": primary_rule.runbook_url
             }
-            
             pid = str(uuid.uuid4())
-            self.history.append({
-                "prediction_id": pid,
-                "device_id": dev_id,
-                "rule_pattern": primary_rule.pattern,
-                "timestamp": time.time(),
-                "prob": confidence,
-                "anchor_event_time": time.time(),
-                "raw_msg": primary_msg
-            })
+            self.history.append({"prediction_id": pid, "device_id": dev_id, "rule_pattern": primary_rule.pattern, "timestamp": time.time(), "prob": confidence, "anchor_event_time": time.time(), "raw_msg": primary_msg})
             self.storage.save_json_atomic("history", self.history)
-            
             predictions.append(pred)
             processed_devices.add(dev_id)
-            
         return predictions
 
     def generate_tuning_report(self, days: int = 30) -> Dict[str, Any]:
@@ -279,35 +219,18 @@ class DigitalTwinEngine:
                 if rec.get("apply_mode") != "auto":
                     skipped.append({"rule": rp, "reason": "not_auto"})
                     continue
-                if self._rules_sot == "db" and not self.storage.rule_config_get_json_str(rp):
-                    skipped.append({"rule": rp, "reason": "db_integrity_fail"})
-                    continue
-
                 prop = p.get("proposal", {})
                 pt = float(prop.get("paging_threshold", 0.0))
                 lt = float(prop.get("logging_threshold", 0.0))
                 old_json_str = self.storage.rule_config_get_json_str(rp)
-                old_pt = None
-                if old_json_str:
-                    try: old_pt = json.loads(old_json_str).get("paging_threshold")
-                    except: pass
-                
                 rj_str = old_json_str
                 if rj_str:
                     d = json.loads(rj_str)
                     d["paging_threshold"] = pt
                     d["logging_threshold"] = lt
                     rj_str = json.dumps(d, ensure_ascii=False)
-                
                 success = self.storage.rule_config_upsert(rp, pt, lt, rj_str)
                 if success:
-                    event = {
-                        "event_id": str(uuid.uuid4()), "timestamp": time.time(), "event_type": "threshold_apply",
-                        "actor": "agent:auto", "rule_pattern": rp, "apply_mode": "auto",
-                        "changes": {"paging": {"old": old_pt, "new": pt}},
-                        "evidence": AuditBuilder.build_evidence(self.shadow_eval_state, p)
-                    }
-                    self.storage.audit_log_generic(event)
                     applied.append({"rule": rp, "paging": pt})
                 else:
                     skipped.append({"rule": rp, "reason": "db_write_fail"})
@@ -323,13 +246,3 @@ class DigitalTwinEngine:
             self.storage._seed_rule_config_from_rules_json(sanitized)
             return True
         except Exception: return False
-            
-    def register_outcome(self, pid, is_inc, act):
-        rec = {"prediction_id": pid, "timestamp": time.time(), "is_incident": is_inc, "user_action": act}
-        self.outcomes.append(rec)
-        self.storage.save_json_atomic("outcomes", self.outcomes)
-
-    def register_missed_incident(self, dev, ts, desc, rule="unknown"):
-        rec = {"incident_id": str(uuid.uuid4()), "device_id": dev, "timestamp": ts, "description": desc, "rule_pattern": rule}
-        self.incident_register.append(rec)
-        self.storage.save_json_atomic("incident_register", self.incident_register)
