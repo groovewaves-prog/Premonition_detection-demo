@@ -78,8 +78,10 @@ class StorageManager:
             yield
         finally:
             if got_lock:
-                try: os.rmdir(lock_path)
-                except: pass
+                try:
+                    os.rmdir(lock_path)
+                except:
+                    pass
 
     # --- SQLite Init & Schema ---
     def _init_sqlite(self):
@@ -87,28 +89,15 @@ class StorageManager:
             self._conn = sqlite3.connect(self.paths["sqlite_db"], check_same_thread=False)
             self._conn.execute('PRAGMA journal_mode=WAL;')
             with self._db_lock:
-                self._conn.execute('''CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT, updated_at REAL)''')
-                self._conn.execute('''CREATE TABLE IF NOT EXISTS metrics (device_id TEXT, rule_pattern TEXT, metric_name TEXT, timestamp REAL, value REAL)''')
+                # テーブル作成SQLを1行にまとめて記述し、SyntaxErrorリスクを低減
+                self._conn.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT, updated_at REAL)')
+                self._conn.execute('CREATE TABLE IF NOT EXISTS metrics (device_id TEXT, rule_pattern TEXT, metric_name TEXT, timestamp REAL, value REAL)')
                 self._conn.execute('CREATE INDEX IF NOT EXISTS idx_metrics_query ON metrics (device_id, rule_pattern, metric_name, timestamp)')
                 
-                self._conn.execute('''
-                    CREATE TABLE IF NOT EXISTS audit_log (
-                        event_id TEXT PRIMARY KEY, timestamp REAL, event_type TEXT, 
-                        actor TEXT, rule_pattern TEXT, details_json TEXT, 
-                        status TEXT DEFAULT 'committed', 
-                        rules_hash_before TEXT, rules_hash_after TEXT, error TEXT
-                    )
-                ''')
+                self._conn.execute('CREATE TABLE IF NOT EXISTS audit_log (event_id TEXT PRIMARY KEY, timestamp REAL, event_type TEXT, actor TEXT, rule_pattern TEXT, details_json TEXT, status TEXT DEFAULT "committed", rules_hash_before TEXT, rules_hash_after TEXT, error TEXT)')
                 
-                self._conn.execute('''
-                    CREATE TABLE IF NOT EXISTS rule_config (
-                        rule_pattern TEXT PRIMARY KEY, 
-                        paging_threshold REAL, 
-                        logging_threshold REAL, 
-                        rule_json TEXT, 
-                        updated_at REAL
-                    )
-                ''')
+                self._conn.execute('CREATE TABLE IF NOT EXISTS rule_config (rule_pattern TEXT PRIMARY KEY, paging_threshold REAL, logging_threshold REAL, rule_json TEXT, updated_at REAL)')
+                
                 self._conn.commit()
         except Exception as e:
             logger.warning(f"SQLite init failed: {e}")
@@ -120,8 +109,7 @@ class StorageManager:
         try:
             val_json = json.dumps(value, ensure_ascii=False)
             with self._db_lock:
-                self._conn.execute('INSERT OR REPLACE INTO state (key, value, updated_at) VALUES (?, ?, ?)',
-                                   (key, val_json, time.time()))
+                self._conn.execute('INSERT OR REPLACE INTO state (key, value, updated_at) VALUES (?, ?, ?)', (key, val_json, time.time()))
                 self._conn.commit()
         except Exception: pass
 
@@ -169,8 +157,7 @@ class StorageManager:
         if not self._conn: return
         try:
             with self._db_lock:
-                self._conn.execute('INSERT INTO metrics VALUES (?, ?, ?, ?, ?)', 
-                                   (dev_id, rule_ptn, metric_name, ts, float(val)))
+                self._conn.execute('INSERT INTO metrics VALUES (?, ?, ?, ?, ?)', (dev_id, rule_ptn, metric_name, ts, float(val)))
                 self._conn.commit()
         except Exception: pass
 
@@ -179,9 +166,7 @@ class StorageManager:
         try:
             with self._db_lock:
                 cur = self._conn.cursor()
-                cur.execute('''SELECT timestamp, value FROM metrics 
-                               WHERE device_id=? AND rule_pattern=? AND metric_name=? AND timestamp >= ? 
-                               ORDER BY timestamp ASC''', (dev_id, rule_ptn, metric_name, min_ts))
+                cur.execute('SELECT timestamp, value FROM metrics WHERE device_id=? AND rule_pattern=? AND metric_name=? AND timestamp >= ? ORDER BY timestamp ASC', (dev_id, rule_ptn, metric_name, min_ts))
                 return cur.fetchall()
         except Exception: return []
 
@@ -199,10 +184,7 @@ class StorageManager:
         if not self._conn: return False
         try:
             with self._db_lock:
-                self._conn.execute(
-                    'INSERT OR REPLACE INTO rule_config (rule_pattern, paging_threshold, logging_threshold, rule_json, updated_at) VALUES (?, ?, ?, ?, ?)',
-                    (rp, pt, lt, rule_json_str, time.time())
-                )
+                self._conn.execute('INSERT OR REPLACE INTO rule_config (rule_pattern, paging_threshold, logging_threshold, rule_json, updated_at) VALUES (?, ?, ?, ?, ?)', (rp, pt, lt, rule_json_str, time.time()))
                 self._conn.commit()
             return True
         except Exception: return False
@@ -240,10 +222,7 @@ class StorageManager:
             }, ensure_ascii=False)
             
             with self._db_lock:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO audit_log (event_id, timestamp, event_type, actor, rule_pattern, details_json, status, rules_hash_before) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (event["event_id"], float(event["timestamp"]), event["event_type"], event["actor"], event["rule_pattern"], d, "prepared", hash_before)
-                )
+                self._conn.execute('INSERT OR REPLACE INTO audit_log (event_id, timestamp, event_type, actor, rule_pattern, details_json, status, rules_hash_before) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (event["event_id"], float(event["timestamp"]), event["event_type"], event["actor"], event["rule_pattern"], d, "prepared", hash_before))
                 self._conn.commit()
             return True
         except Exception: return False
@@ -252,8 +231,7 @@ class StorageManager:
         if not self._conn: return False
         try:
             with self._db_lock:
-                self._conn.execute("UPDATE audit_log SET status='committed', rules_hash_after=?, error=NULL WHERE event_id=?", 
-                                   (hash_after, event_id))
+                self._conn.execute("UPDATE audit_log SET status='committed', rules_hash_after=?, error=NULL WHERE event_id=?", (hash_after, event_id))
                 self._conn.commit()
             return True
         except Exception: return False
@@ -262,8 +240,7 @@ class StorageManager:
         if not self._conn: return False
         try:
             with self._db_lock:
-                self._conn.execute("UPDATE audit_log SET status='aborted', error=? WHERE event_id=?", 
-                                   ((error_msg or "")[:2000], event_id))
+                self._conn.execute("UPDATE audit_log SET status='aborted', error=? WHERE event_id=?", ((error_msg or "")[:2000], event_id))
                 self._conn.commit()
             return True
         except Exception: return False
@@ -273,10 +250,6 @@ class StorageManager:
         try:
             details = json.dumps(event.get("details", {}), ensure_ascii=False)
             with self._db_lock:
-                self._conn.execute(
-                    'INSERT INTO audit_log (event_id, timestamp, event_type, actor, rule_pattern, details_json, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    (str(event.get("event_id") or uuid.uuid4()), float(event.get("timestamp") or time.time()), 
-                     str(event.get("event_type")), str(event.get("actor")), str(event.get("rule_pattern")), details, "committed")
-                )
+                self._conn.execute('INSERT INTO audit_log (event_id, timestamp, event_type, actor, rule_pattern, details_json, status) VALUES (?, ?, ?, ?, ?, ?, ?)', (str(event.get("event_id") or uuid.uuid4()), float(event.get("timestamp") or time.time()), str(event.get("event_type")), str(event.get("actor")), str(event.get("rule_pattern")), details, "committed"))
                 self._conn.commit()
         except Exception: pass
