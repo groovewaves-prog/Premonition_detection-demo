@@ -23,8 +23,11 @@ from network_ops import (
     RemediationEnvironment,
     sanitize_output
 )
+
+# === インポート修正: 機能別に正しいモジュールから読み込む ===
 from utils.helpers import get_status_from_alarms, get_status_icon, load_config_by_id
 from utils.llm_helper import get_rate_limiter, generate_content_with_retry
+
 from verifier import verify_log_content
 from .graph import render_topology_graph
 
@@ -187,6 +190,39 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     
     st.markdown("---")
     
+    # =====================================================
+    # インシデント候補 & 影響範囲リストの分離 (UX完全復元)
+    # =====================================================
+    root_cause_ids = {a.device_id for a in alarms if a.is_root_cause}
+    downstream_ids = {a.device_id for a in alarms if not a.is_root_cause}
+    
+    rc_candidates = []
+    ds_devices = []
+    
+    for cand in analysis_results:
+        device_id = cand.get('id', '')
+        # ★重要: オリジナルの優先順位を厳密に再現
+        # 1. 予兆判定
+        if cand.get('is_prediction'):
+            rc_candidates.append(cand)
+        # 2. 根本原因フラグあり
+        elif device_id in root_cause_ids:
+            rc_candidates.append(cand)
+        # 3. 影響デバイス（下流）に含まれるか？ -> ここで分離しないと、次のprob判定で吸い込まれる
+        elif device_id in downstream_ids:
+            ds_devices.append(cand)
+        # 4. その他の高確度アラート
+        elif cand.get('prob', 0) > 0.5:
+            rc_candidates.append(cand)
+            
+    if not rc_candidates and not alarms:
+        rc_candidates = [{"id": "SYSTEM", "label": "正常稼働", "prob": 0.0, "type": "Normal"}]
+
+    # ★ 青帯バナー（根本原因と影響範囲のサマリ）の復活
+    if rc_candidates and ds_devices:
+        top_cause = rc_candidates[0]['id']
+        st.info(f"📍 **根本原因**: {top_cause} → 影響範囲: 配下 {len(ds_devices)} 機器")
+
     # Future Radar
     preds = [c for c in analysis_results if c.get('is_prediction')]
     if preds:
@@ -208,23 +244,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     with st.expander("🔍 検知詳細"):
                         st.text(item.get('reason', ''))
         st.markdown("---")
-
-    # インシデント候補 & 影響範囲リスト
-    root_cause_ids = {a.device_id for a in alarms if a.is_root_cause}
-    downstream_ids = {a.device_id for a in alarms if not a.is_root_cause}
-    
-    rc_candidates = []
-    ds_devices = []
-    
-    for c in analysis_results:
-        did = c.get('id')
-        if c.get('is_prediction') or did in root_cause_ids or c.get('prob', 0) > 0.5:
-            rc_candidates.append(c)
-        elif did in downstream_ids:
-            ds_devices.append(c)
-            
-    if not rc_candidates and not alarms:
-        rc_candidates = [{"id": "SYSTEM", "label": "正常稼働", "prob": 0.0, "type": "Normal"}]
 
     selected_cand = None
     target_dev_id = None
@@ -257,7 +276,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             selected_cand = rc_candidates[0]
             target_dev_id = rc_candidates[0]['id']
 
-        # ★ ここが復活箇所: 影響を受けている機器（上流復旧待ち）リスト
+        # ★ 影響を受けている機器（上流復旧待ち）リストの復活
         if ds_devices:
             with st.expander(f"▼ 影響を受けている機器 ({len(ds_devices)}台) - 上流復旧待ち", expanded=False):
                 dd_df = pd.DataFrame([
