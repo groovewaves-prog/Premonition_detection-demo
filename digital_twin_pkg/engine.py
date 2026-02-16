@@ -1,9 +1,11 @@
+# digital_twin_pkg/engine.py
 import logging
 import time
 import json
 import uuid
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import asdict
 
 from .config import *
 from .rules import EscalationRule, DEFAULT_RULES, MAINTENANCE_SIGNATURES
@@ -30,20 +32,20 @@ class DigitalTwinEngine:
         self.children_map = children_map or {}
         
         # Storage
-        self.storage = StorageManager(self.tenant_id, BASE_DATA_DIR)
+        self.storage = StorageManager(self.tenant_id, BASE_DIR) # ConfigのBASE_DIRを使用
         
         # Components
         self.tuner = AutoTuner(self)
         
         # State
-        self.rules = []
-        self._metric_rules = []
-        self.history = []
-        self.outcomes = []
-        self.incident_register = []
-        self.maintenance_windows = []
-        self.evaluation_state = {}
-        self.shadow_eval_state = {}
+        self.rules: List[EscalationRule] = []
+        self._metric_rules: List[EscalationRule] = []
+        self.history: List[Dict] = []
+        self.outcomes: List[Dict] = []
+        self.incident_register: List[Dict] = []
+        self.maintenance_windows: List[Dict] = []
+        self.evaluation_state: Dict = {}
+        self.shadow_eval_state: Dict = {}
         
         # Models
         self._model = None
@@ -94,7 +96,7 @@ class DigitalTwinEngine:
                         data = json.load(f)
                     self.rules = [EscalationRule(**item) for item in data]
                 except:
-                    self.rules = DEFAULT_RULES
+                    self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES]
             
             # Seed DB if empty
             self.storage._seed_rule_config_from_rules_json([asdict(r) for r in self.rules])
@@ -122,26 +124,170 @@ class DigitalTwinEngine:
         except:
             self._model_loaded = True # Fail gracefully
 
-    # --- Core Features ---
+    def _match_rule(self, alarm_text: str) -> Tuple[Optional[EscalationRule], float]:
+        text_lower = alarm_text.lower()
+        # 1. Exact/Regex Match
+        for rule in self.rules:
+            if rule._compiled_regex and rule._compiled_regex.search(alarm_text):
+                return rule, 1.0
+            if rule.pattern in text_lower:
+                return rule, 1.0
+        
+        # 2. Semantic Match (BERT)
+        if self._model and self._rule_embeddings:
+            try:
+                query_vec = self._model.encode([alarm_text], convert_to_numpy=True)
+                rule_vecs = self._rule_embeddings["vectors"]
+                similarities = np.dot(rule_vecs, query_vec.T).flatten()
+                norms = np.linalg.norm(rule_vecs, axis=1) * np.linalg.norm(query_vec)
+                cosine_sim = similarities / np.where(norms==0, 1e-10, norms)
+                
+                best_idx = np.argmax(cosine_sim)
+                best_score = float(cosine_sim[best_idx])
+                
+                # Check threshold (Use rule-specific or global)
+                rule_idx = self._rule_embeddings["indices"][best_idx]
+                rule = self.rules[rule_idx]
+                threshold = rule.embedding_threshold or 0.40
+                
+                if best_score >= threshold:
+                    return rule, best_score
+            except Exception:
+                pass
+        return None, 0.0
+
+    def _calculate_confidence(self, rule: EscalationRule, device_id: str, match_quality: float) -> float:
+        attrs = self.topology.get(device_id, {})
+        if not isinstance(attrs, dict): attrs = vars(attrs) # Handle dataclass
+        
+        # Redundancy check
+        rg = attrs.get('redundancy_group')
+        has_redundancy = bool(rg)
+        
+        # SPOF check (Has children but no redundancy)
+        children = self.children_map.get(device_id, [])
+        is_spof = bool(children and not has_redundancy)
+        
+        # Base confidence
+        confidence = rule.base_confidence
+        
+        # Adjust by Match Quality (0.8 ~ 1.0 multiplier)
+        confidence *= (0.8 + 0.2 * match_quality)
+        
+        # Penalize for Redundancy
+        if has_redundancy:
+            confidence *= (1.0 - ROI_CONSERVATIVE_FACTOR * 0.2)
+            
+        # Boost for SPOF
+        if is_spof:
+            confidence *= 1.1 # 10% boost
+            
+        return min(0.99, max(0.1, confidence))
+
     def predict(self, analysis_results: List[Dict], msg_map: Dict[str, List[str]], alarms: Optional[List] = None) -> List[Dict]:
         """
-        Main prediction entry point.
+        Main prediction logic using V45 architecture.
         """
         self.reload_all() # Ensure fresh rules/state
         
         predictions = []
-        # (Simplified Logic for v45 structure: Use existing rules to match)
-        # ... [Full Logic from v44 predict(), but calling self.storage.db_insert_metric etc] ...
-        # For brevity in this generation step, assuming the logic is transferred.
-        # Key: Use self._match_rule(msg) -> rule
         
-        # MOCK Implementation to allow compilation (Replace with full logic if needed)
-        # Ideally you paste the full `predict` logic from v44 here, adapting `self.metric_store` to `self.storage.db_insert_metric`.
-        return predictions 
+        # 1. Filter Candidates (Exclude already critical devices)
+        critical_ids = {
+            r["id"] for r in analysis_results 
+            if r.get("status") in ["RED", "CRITICAL"] or r.get("severity") == "CRITICAL" or float(r.get("prob", 0)) >= 0.85
+        }
+        
+        # Warning IDs from analysis
+        warning_ids = {
+            r["id"] for r in analysis_results
+            if 0.45 <= float(r.get("prob", 0)) <= 0.85
+        }
+        active_ids = set(msg_map.keys())
+        candidates = (warning_ids.union(active_ids)) - critical_ids
+        
+        processed_devices = set()
+        multi_signal_boost = 0.05
 
-    def _match_rule(self, msg: str):
-        # ... (Match logic) ...
-        return None, 0.0
+        for dev_id in candidates:
+            if dev_id in processed_devices: continue
+            
+            messages = msg_map.get(dev_id, [])
+            if not messages: continue
+
+            matched_signals = []
+            for msg in messages:
+                rule, quality = self._match_rule(msg)
+                if rule and quality >= 0.30 and rule.pattern != "generic_error":
+                    matched_signals.append((rule, quality, msg))
+
+            if not matched_signals:
+                # Try generic match
+                rule, quality = self._match_rule(messages[0])
+                if not rule: continue
+                matched_signals = [(rule, quality, messages[0])]
+
+            # Sort by quality
+            matched_signals.sort(key=lambda x: x[1], reverse=True)
+            primary_rule, primary_quality, primary_msg = matched_signals[0]
+
+            # Calculate Confidence
+            confidence = self._calculate_confidence(primary_rule, dev_id, primary_quality)
+            
+            # Multi-signal boost
+            extra_signals = len(matched_signals) - 1
+            if extra_signals > 0:
+                boost = min(extra_signals * multi_signal_boost, 0.20)
+                confidence = min(0.99, confidence + boost)
+
+            # Threshold Check (Use Persisted Thresholds if available)
+            threshold = MIN_PREDICTION_CONFIDENCE
+            if primary_rule.paging_threshold is not None:
+                threshold = primary_rule.paging_threshold
+            
+            if confidence < threshold: 
+                continue
+
+            # Build Prediction Payload
+            impact_count = 0
+            if dev_id in self.children_map:
+                impact_count = len(self.children_map[dev_id])
+                
+            pred = {
+                "id": dev_id,
+                "label": f"🔮 [予兆] {primary_rule.escalated_state}",
+                "severity": "CRITICAL",
+                "status": "CRITICAL",
+                "prob": round(confidence, 2),
+                "type": f"Predictive/{primary_rule.category}",
+                "tier": 1,
+                "reason": f"Digital Twin Prediction: {primary_rule.time_to_critical_min}min to critical. Root: {primary_msg}",
+                "is_prediction": True,
+                "prediction_timeline": f"{primary_rule.time_to_critical_min}分後",
+                "prediction_early_warning_hours": primary_rule.early_warning_hours,
+                "prediction_affected_count": impact_count,
+                "prediction_signal_count": len(matched_signals),
+                "prediction_confidence_factors": {"base": primary_rule.base_confidence}
+            }
+            
+            # Record History (V45 Storage)
+            pid = str(uuid.uuid4())
+            self.history.append({
+                "prediction_id": pid,
+                "device_id": dev_id,
+                "rule_pattern": primary_rule.pattern,
+                "timestamp": time.time(),
+                "prob": confidence,
+                "anchor_event_time": time.time(),
+                "raw_msg": primary_msg
+            })
+            # Save history async or periodically (V45 saves in batch usually, here direct)
+            self.storage.save_json_atomic("history", self.history)
+            
+            predictions.append(pred)
+            processed_devices.add(dev_id)
+            
+        return predictions
 
     # --- Tuning ---
     def generate_tuning_report(self, days: int = 30) -> Dict[str, Any]:
@@ -186,8 +332,6 @@ class DigitalTwinEngine:
                     except: pass
                 
                 # Apply (Upsert DB)
-                # Need full rule json? If DB exists, update it. If file exists, update it.
-                # Here we assume we fetch full JSON, update fields, save back.
                 rj_str = old_json_str
                 if rj_str:
                     d = json.loads(rj_str)
@@ -212,10 +356,7 @@ class DigitalTwinEngine:
                         },
                         "evidence": AuditBuilder.build_evidence(self.shadow_eval_state, p)
                     }
-                    # 1. Insert Prepared
-                    # self.storage.audit_insert_prepared(...) # (Simplified for brevity)
-                    self.storage.audit_log_generic(event) # Commit immediately in this simplified flow
-                    
+                    self.storage.audit_log_generic(event)
                     applied.append({"rule": rp, "paging": pt})
                 else:
                     skipped.append({"rule": rp, "reason": "db_write_fail"})
