@@ -23,16 +23,13 @@ from network_ops import (
     RemediationEnvironment,
     sanitize_output
 )
-
-# === 修正箇所: インポート先を適切に分離 ===
 from utils.helpers import get_status_from_alarms, get_status_icon, load_config_by_id
 from utils.llm_helper import get_rate_limiter, generate_content_with_retry
-
 from verifier import verify_log_content
 from .graph import render_topology_graph
 
 # =====================================================
-# ローカルヘルパー関数 (app.pyから移植)
+# ローカルヘルパー関数
 # =====================================================
 def _hash_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
@@ -96,7 +93,6 @@ def run_diagnostic_simulation_no_llm(selected_scenario: str, target_node_obj) ->
             lines += ["show system alarms", "No active alarms", "ping 8.8.8.8 repeat 5", "Success rate is 100 percent"]
         return {"status": "SUCCESS", "sanitized_log": "\n".join(lines), "device_id": device_id}
 
-    # Failure simulation
     if "WAN全回線断" in selected_scenario or "[WAN]" in selected_scenario:
         lines += ["show ip interface brief", "GigabitEthernet0/0 down down", "Neighbor 203.0.113.2 Idle"]
     elif "FW片系障害" in selected_scenario or "[FW]" in selected_scenario:
@@ -115,7 +111,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     display_name = get_display_name(site_id)
     scenario = st.session_state.site_scenarios.get(site_id, "正常稼働")
     
-    # ヘッダー & 戻るボタン (Custom CSS)
+    # ヘッダー & 戻るボタン
     col_header = st.columns([4, 1])
     with col_header[0]:
         st.markdown(f"### 🛡️ AIOps インシデント・コックピット")
@@ -152,7 +148,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     alarms = generate_alarms_for_scenario(topology, scenario)
     status = get_status_from_alarms(scenario, alarms)
     
-    # 予兆シグナル注入
     injected = st.session_state.get("injected_weak_signal")
     if injected and injected["device_id"] in topology:
         for m in injected.get("messages", []):
@@ -168,7 +163,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         "id": "SYSTEM", "label": "正常稼働", "prob": 0.0, "type": "Normal", "tier": 3, "reason": "アラームなし"
     }]
     
-    # --- KPIメトリクス (元のレイアウト) ---
+    # KPIメトリクス
     root_cause_alarms = [a for a in alarms if a.is_root_cause]
     total_alarms = len(alarms)
     noise_reduction = ((total_alarms - len(root_cause_alarms)) / total_alarms * 100) if total_alarms > 0 else 0.0
@@ -192,7 +187,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     
     st.markdown("---")
     
-    # --- Future Radar (予兆がある場合のみ) ---
+    # Future Radar
     preds = [c for c in analysis_results if c.get('is_prediction')]
     if preds:
         st.markdown("### 🔮 AIOps Future Radar")
@@ -212,10 +207,9 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     st.markdown(f"**急性期:** {item.get('prediction_timeline','不明')}")
                     with st.expander("🔍 検知詳細"):
                         st.text(item.get('reason', ''))
-
         st.markdown("---")
 
-    # --- インシデント候補テーブル & 影響範囲 ---
+    # インシデント候補 & 影響範囲リスト
     root_cause_ids = {a.device_id for a in alarms if a.is_root_cause}
     downstream_ids = {a.device_id for a in alarms if not a.is_root_cause}
     
@@ -263,7 +257,20 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             selected_cand = rc_candidates[0]
             target_dev_id = rc_candidates[0]['id']
 
-    # --- 2カラムレイアウト (Topology / AI Ops) ---
+        # ★ ここが復活箇所: 影響を受けている機器（上流復旧待ち）リスト
+        if ds_devices:
+            with st.expander(f"▼ 影響を受けている機器 ({len(ds_devices)}台) - 上流復旧待ち", expanded=False):
+                dd_df = pd.DataFrame([
+                    {"No": i+1, "デバイス": d['id'], "状態": "⚫ 応答なし", "備考": "上流復旧待ち"}
+                    for i, d in enumerate(ds_devices)
+                ])
+                if len(ds_devices) >= 10:
+                    with st.container(height=300):
+                        st.dataframe(dd_df, use_container_width=True, hide_index=True)
+                else:
+                    st.dataframe(dd_df, use_container_width=True, hide_index=True)
+
+    # 2カラムレイアウト
     col_map, col_chat = st.columns([1.2, 1])
     
     with col_map:
@@ -310,9 +317,8 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     btn_label = "🔮 予兆分析レポート" if selected_cand.get('is_prediction') else "📝 詳細レポート作成"
                     if st.button(btn_label):
                         cont = st.empty()
-                        # Context building
                         t_node = topology.get(selected_cand['id'])
-                        topology_context = {"id": selected_cand['id']} # Simplified context
+                        topology_context = {"id": selected_cand['id']}
                         target_conf = load_config_by_id(selected_cand['id'])
                         
                         cache_key = _hash_text(f"{site_id}|{scenario}|{selected_cand['id']}")
@@ -379,7 +385,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         st.session_state.remediation_plan = None
                         st.rerun()
 
-        # Chat
         with st.expander("💬 Chat with AI Agent", expanded=False):
             if not st.session_state.chat_session and api_key and GENAI_AVAILABLE:
                 genai.configure(api_key=api_key)
