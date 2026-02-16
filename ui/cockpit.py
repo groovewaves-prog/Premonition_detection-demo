@@ -7,7 +7,7 @@ from alarm_generator import generate_alarms_for_scenario, Alarm
 from inference_engine import LogicalRCA
 from network_ops import generate_analyst_report_streaming, generate_remediation_commands_streaming, run_remediation_parallel_v2, RemediationEnvironment
 from utils.helpers import get_status_from_alarms, get_status_icon, load_config_by_id, hash_text
-from ui.graph import render_topology_graph
+from .graph import render_topology_graph
 
 def render_incident_cockpit(site_id: str, api_key: str):
     st.markdown(f"### 🛡️ インシデント・コックピット: {get_display_name(site_id)}")
