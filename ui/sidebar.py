@@ -1,3 +1,4 @@
+# ui/sidebar.py  ―  Streamlit サイドバー UI（予兆シミュレーション・シナリオ設定）
 import streamlit as st
 import os
 from registry import list_sites, get_display_name, load_topology, get_paths
