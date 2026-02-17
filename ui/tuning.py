@@ -1,187 +1,181 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-import os
-import json
+from typing import List
+from dataclasses import dataclass
 
-from registry import get_paths, load_topology, get_display_name
+from registry import list_sites, get_paths, load_topology, get_display_name
+from alarm_generator import generate_alarms_for_scenario, get_alarm_summary
+from utils.helpers import get_status_from_alarms, get_status_icon
 
 
-def _get_or_init_dt_engine(site_id: str):
-    """
-    Digital Twin Engine を取得または初期化する。
+@dataclass
+class SiteStatus:
+    site_id: str
+    display_name: str
+    scenario: str
+    status: str
+    alarm_count: int
+    critical_count: int
+    warning_count: int
+    affected_devices: List[str]
+    is_maintenance: bool
+    mttr_estimate: str
 
-    【根本原因と対策】
-    リファクタリング後、tuning.py は `engine.digital_twin` を参照しているが、
-    LogicalRCA には digital_twin 属性が存在しない。
 
-    対策:
-    1. st.session_state に直接 dt_engine を保存するキーを用意する
-    2. 未初期化なら DigitalTwinEngine をここで生成してキャッシュする
-    3. cockpit.py 側でも同じキーで保存することで共有できる
-    """
-    dt_key = f"dt_engine_{site_id}"
-
-    # すでに初期化済みならそのまま返す
-    if st.session_state.get(dt_key) is not None:
-        return st.session_state[dt_key]
-
-    # digital_twin.py から DigitalTwinEngine をインポートして初期化
-    try:
-        from digital_twin import DigitalTwinEngine
-
+def build_site_statuses() -> List[SiteStatus]:
+    """全拠点の状態を構築"""
+    sites = list_sites()
+    statuses = []
+    for site_id in sites:
+        scenario = st.session_state.site_scenarios.get(site_id, "正常稼働")
         paths = get_paths(site_id)
         topology = load_topology(paths.topology_path)
-        if not topology:
-            return None
+        alarms = generate_alarms_for_scenario(topology, scenario)
+        summary = get_alarm_summary(alarms)
+        status = get_status_from_alarms(scenario, alarms)
+        is_maint = st.session_state.maint_flags.get(site_id, False)
 
-        # 子ノードマップを構築
-        children_map = {}
-        for node_id, node in topology.items():
-            parent_id = (node.get('parent_id') if isinstance(node, dict)
-                         else getattr(node, 'parent_id', None))
-            if parent_id:
-                children_map.setdefault(parent_id, []).append(node_id)
+        mttr = f"{30 + summary['total'] * 5}分" if status in ["停止", "要対応"] else "-"
 
-        dt_engine = DigitalTwinEngine(
-            topology=topology,
-            children_map=children_map,
-            tenant_id=site_id
+        statuses.append(SiteStatus(
+            site_id=site_id,
+            display_name=get_display_name(site_id),
+            scenario=scenario,
+            status=status,
+            alarm_count=summary['total'],
+            critical_count=summary['critical'],
+            warning_count=summary['warning'],
+            affected_devices=summary['devices'],
+            is_maintenance=is_maint,
+            mttr_estimate=mttr
+        ))
+
+    priority = {"停止": 0, "要対応": 1, "注意": 2, "正常": 3}
+    statuses.sort(key=lambda s: (priority.get(s.status, 4), -s.alarm_count))
+    return statuses
+
+
+def render_site_status_board():
+    """拠点状態ボード"""
+    st.subheader("🏢 拠点状態ボード")
+    statuses = build_site_statuses()
+
+    cols = st.columns(4)
+    cols[0].metric("🔴 障害発生", f"{sum(1 for s in statuses if s.status == '停止')}拠点")
+    cols[1].metric("🟠 要対応",   f"{sum(1 for s in statuses if s.status == '要対応')}拠点")
+    cols[2].metric("🟡 注意",     f"{sum(1 for s in statuses if s.status == '注意')}拠点")
+    cols[3].metric("🟢 正常",     f"{sum(1 for s in statuses if s.status == '正常')}拠点")
+
+    st.divider()
+
+    cols_per_row = 2
+    for i in range(0, len(statuses), cols_per_row):
+        row_cols = st.columns(cols_per_row)
+        for j, col in enumerate(row_cols):
+            if i + j < len(statuses):
+                site = statuses[i + j]
+                with col.container(border=True):
+                    c1, c2 = st.columns([3, 1])
+                    c1.markdown(f"### {get_status_icon(site.status)} {site.display_name}")
+                    if c2.button("詳細", key=f"board_det_{site.site_id}", type="primary"):
+                        st.session_state.active_site = site.site_id
+                        # セッション状態をリセット
+                        st.session_state.live_result = None
+                        st.session_state.verification_result = None
+                        st.session_state.generated_report = None
+                        st.session_state.remediation_plan = None
+                        st.session_state.messages = []
+                        st.session_state.chat_session = None
+                        st.rerun()
+
+                    if site.is_maintenance:
+                        st.caption("🛠️ メンテナンス中")
+
+                    scenario_display = site.scenario.split(". ", 1)[-1] if ". " in site.scenario else site.scenario
+                    st.caption(f"📋 {scenario_display}")
+
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("ステータス", site.status)
+                    m2.metric("アラーム", f"{site.alarm_count}件")
+                    m3.metric("MTTR", site.mttr_estimate)
+
+                    if site.alarm_count > 0:
+                        severity = min(100, site.critical_count * 30 + site.warning_count * 10)
+                        st.progress(severity / 100, text=f"深刻度: {severity}%")
+
+                    if site.affected_devices:
+                        st.caption(f"影響機器: {', '.join(site.affected_devices[:3])}")
+
+
+def render_triage_center():
+    """
+    トリアージ・コマンドセンター（旧UIを完全復元）
+    ─ フィルタ（ステータス multiselect + メンテナンス中チェック）
+    ─ 各拠点を border付きコンテナ + 5カラムレイアウトで表示
+      [アイコン | 拠点名/シナリオ | CRITICAL/WARNING件数 | MTTR | 詳細を確認ボタン]
+    """
+    st.subheader("🚨 トリアージ・コマンドセンター")
+
+    statuses = build_site_statuses()
+
+    # ── フィルタ行（旧UIと同じ2カラム構成）──
+    col1, col2 = st.columns(2)
+    with col1:
+        filter_status = st.multiselect(
+            "ステータスでフィルタ",
+            ["停止", "要対応", "注意", "正常"],
+            default=["停止", "要対応"],
+            key="triage_filter"
         )
-        st.session_state[dt_key] = dt_engine
-        return dt_engine
+    with col2:
+        show_maint = st.checkbox("メンテナンス中を含む", value=False, key="triage_maint")
 
-    except ImportError:
-        return None
-    except Exception as e:
-        st.session_state[dt_key] = None  # 初期化失敗を記録（無限リトライ防止）
-        return None
+    filtered = [
+        s for s in statuses
+        if s.status in filter_status
+        and (show_maint or not s.is_maintenance)
+    ]
 
-
-def render_tuning_dashboard(site_id: str):
-    st.subheader("🔧 Digital Twin Tuning & Audit")
-
-    # ── Digital Twin Engine 取得 ──────────────────────────
-    dt_engine = _get_or_init_dt_engine(site_id)
-
-    if not dt_engine:
-        st.warning(
-            "⚠️ Digital Twin Engine が初期化できませんでした。\n\n"
-            "**考えられる原因:**\n"
-            "- `digital_twin.py` がプロジェクトルートに存在しない\n"
-            "- `DigitalTwinEngine.__init__()` で例外が発生した\n\n"
-            "コックピット画面でシナリオを選択してからもう一度お試しください。"
-        )
+    if not filtered:
+        st.info("フィルタ条件に該当する拠点はありません。")
         return
 
-    display_name = get_display_name(site_id)
-    st.caption(f"対象拠点: **{display_name}** | テナントID: `{site_id}`")
+    # ── 各拠点カード（旧UIと同じ5カラムレイアウト）──
+    for site in filtered:
+        with st.container(border=True):
+            cols = st.columns([0.5, 2, 1.5, 1, 1.5])
 
-    tab1, tab2, tab3 = st.tabs(["⚡ Auto-Tuning", "📜 Audit Log", "🛑 Maintenance"])
+            # col[0]: ステータスアイコン（大）
+            with cols[0]:
+                st.markdown(f"## {get_status_icon(site.status)}")
 
-    # ── Tab1: Auto-Tuning ────────────────────────────────
-    with tab1:
-        st.caption("AIによる閾値自動調整の提案を確認し、適用します。")
+            # col[1]: 拠点名 + シナリオ
+            with cols[1]:
+                st.markdown(f"**{site.display_name}**")
+                scenario_short = site.scenario.split(". ", 1)[-1][:30]
+                st.caption(scenario_short)
 
-        if st.button("🔄 提案を生成 (Generate)", key="tuning_gen"):
-            with st.spinner("Analyzing prediction history..."):
-                try:
-                    report = dt_engine.generate_tuning_report(days=30)
-                    st.session_state["tuning_report"] = report
-                except Exception as e:
-                    st.error(f"レポート生成エラー: {e}")
+            # col[2]: CRITICAL / WARNING 件数
+            with cols[2]:
+                if site.critical_count > 0:
+                    st.error(f"🔴 {site.critical_count} CRITICAL")
+                if site.warning_count > 0:
+                    st.warning(f"🟡 {site.warning_count} WARNING")
 
-        report = st.session_state.get("tuning_report")
-        if report and report.get("tuning_proposals"):
-            for p in report["tuning_proposals"]:
-                rule_pattern = p.get('rule_pattern', '不明')
-                rec = p.get('apply_recommendation', {})
-                with st.expander(f"📦 {rule_pattern} ({rec.get('apply_mode', '-')})", expanded=True):
-                    c1, c2, c3 = st.columns(3)
-                    stats = p.get('current_stats', {})
-                    proposal = p.get('proposal', {})
-                    impact = p.get('expected_impact', {})
-                    c1.metric("Recall (再現率)", f"{stats.get('recall', 0):.2f}")
-                    c2.metric("New Threshold",   f"{proposal.get('paging_threshold', 0):.2f}")
-                    c3.metric("FP Reduction",    f"-{impact.get('fp_reduction', 0)*100:.0f}%",
-                              delta_color="normal")
-                    st.markdown(f"**理由:** {rec.get('shadow_note', '-')}")
-                    if rec.get('apply_mode') == 'auto':
-                        st.success("✅ Auto-Eligible (推奨)")
-                    if st.button(f"承認して適用 (Apply)", key=f"ap_{rule_pattern}"):
-                        try:
-                            res = dt_engine.apply_tuning_proposals_if_auto([p])
-                            if res.get('applied'):
-                                st.success(f"適用完了: {res['applied']}")
-                            else:
-                                st.error(f"適用失敗/スキップ: {res.get('skipped', [])}")
-                        except Exception as e:
-                            st.error(f"適用エラー: {e}")
-        else:
-            st.info("現在、適用すべき新しい提案はありません。")
+            # col[3]: MTTR（ラベル非表示）
+            with cols[3]:
+                st.metric("MTTR", site.mttr_estimate, label_visibility="collapsed")
 
-    # ── Tab2: Audit Log ──────────────────────────────────
-    with tab2:
-        st.caption("システムに加えられた変更の監査ログ（SQLite）を表示します。")
-
-        # ★ 修正: dt_engine.storage.paths → dt_engine.paths（正しい属性名）
-        db_path = dt_engine.paths.get("sqlite_db", "")
-
-        if db_path and os.path.exists(db_path):
-            try:
-                conn = sqlite3.connect(db_path)
-                df = pd.read_sql(
-                    "SELECT timestamp, event_type, actor, rule_pattern, status "
-                    "FROM audit_log ORDER BY timestamp DESC LIMIT 50",
-                    conn
-                )
-                conn.close()
-                if not df.empty:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("監査ログはまだありません。")
-            except Exception as e:
-                st.error(f"ログ読み込みエラー: {e}")
-        else:
-            st.warning(f"監査データベースが見つかりません。\n\nパス: `{db_path}`")
-
-    # ── Tab3: Maintenance ────────────────────────────────
-    with tab3:
-        st.markdown("#### System Maintenance")
-
-        col_m1, col_m2 = st.columns(2)
-
-        with col_m1:
-            if st.button("🚑 DB Repair (Self-Healing)", key="dt_repair"):
-                try:
-                    # repair_rule_config が存在する場合
-                    if hasattr(dt_engine, 'repair_rule_config'):
-                        result = dt_engine.repair_rule_config()
-                    elif hasattr(dt_engine, 'repair_db_from_rules_json'):
-                        result = dt_engine.repair_db_from_rules_json()
-                    else:
-                        result = False
-                    if result:
-                        st.success("DBを rules.json から復元しました。")
-                    else:
-                        st.error("復元に失敗しました（メソッドが利用できないか、対象データがありません）。")
-                except Exception as e:
-                    st.error(f"DB修復エラー: {e}")
-
-        with col_m2:
-            if st.button("🧹 Cache Clear", key="dt_cache_clear"):
-                st.cache_data.clear()
-                st.cache_resource.clear()
-                # dt_engine キャッシュもリセット
-                dt_key = f"dt_engine_{site_id}"
-                if dt_key in st.session_state:
-                    del st.session_state[dt_key]
-                st.success("キャッシュをクリアしました。次回アクセス時に再初期化されます。")
-
-        st.divider()
-        st.markdown("#### 📊 Engine Status")
-        col_s1, col_s2, col_s3 = st.columns(3)
-        col_s1.metric("ルール数",   len(getattr(dt_engine, 'rules', [])))
-        col_s2.metric("履歴件数",   len(getattr(dt_engine, 'history', [])))
-        col_s3.metric("アウトカム", len(getattr(dt_engine, 'outcomes', [])))
+            # col[4]: 詳細を確認ボタン
+            with cols[4]:
+                btn_type = "primary" if site.status in ["停止", "要対応"] else "secondary"
+                if st.button("📋 詳細を確認", key=f"triage_detail_{site.site_id}", type=btn_type):
+                    st.session_state.active_site = site.site_id
+                    # セッション状態をリセット
+                    st.session_state.live_result = None
+                    st.session_state.verification_result = None
+                    st.session_state.generated_report = None
+                    st.session_state.remediation_plan = None
+                    st.session_state.messages = []
+                    st.session_state.chat_session = None
+                    st.rerun()
