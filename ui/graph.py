@@ -1,4 +1,4 @@
-# ui/graph.py    ―  トポロジーグラフ描画（Graphviz・予兆アンバーハイライト）
+# ui/graph.py    ―  トポロジーグラフ描画（Graphviz・予兆アンバーハイライト・優先順位修正）
 import graphviz
 from alarm_generator import NodeColor, Alarm
 from typing import List
@@ -71,7 +71,8 @@ def render_topology_graph(topology: dict, alarms: List[Alarm], analysis_results:
             fontcolor = "#BF360C"
             label += "\n🔬 [SIM-PRED]"
 
-        # 2. アラームに基づく上書き（以前の仕様）
+        # 2. アラームに基づく上書き
+        # 優先順位: CRITICAL/WARNING/SILENT > 予兆(アンバー) > Unreachable
         if node_id in alarm_map:
             info = alarm_map[node_id]
             if info['is_root_cause']:
@@ -87,9 +88,11 @@ def render_topology_graph(topology: dict, alarms: List[Alarm], analysis_results:
                     penwidth = "2"
                     label += "\n[WARNING]"
             else:
-                # 影響デバイス（グレー）
-                color = NodeColor.UNREACHABLE
-                fontcolor = "#546e7a"
+                # Unreachable は予兆より低優先度
+                # 既にアンバー（予兆）が塗られている場合は上書きしない
+                if node_id not in predicted_ids_real and node_id not in predicted_ids_sim:
+                    color = NodeColor.UNREACHABLE
+                    fontcolor = "#546e7a"
                 label += "\n[Unreachable]"
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
