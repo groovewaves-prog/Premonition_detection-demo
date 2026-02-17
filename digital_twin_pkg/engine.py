@@ -360,17 +360,28 @@ class DigitalTwinEngine:
         EscalationRule ベースの予兆予測。
         戻り値は PredictResult.to_dict() のリスト（confidence 降順）。
         """
-        if self._should_ignore(msg):
+        # _normalize_msg はオプション（存在しない場合はそのまま使用）
+        try:
+            msg_n = self._normalize_msg(msg or "")
+        except AttributeError:
+            msg_n = (msg or "").strip()
+        except Exception:
+            msg_n = (msg or "").strip()
+
+        if self._should_ignore(msg_n):
             return []
+
+        # MIN_PREDICTION_CONFIDENCE は config 定数（self.属性ではない）
+        _min_conf = float(MIN_PREDICTION_CONFIDENCE)
 
         results = []
         for rule in (self.rules or []):
             try:
-                hit, reasons = self._rule_match_simple(rule, msg)
+                hit, reasons = self._rule_match_simple(rule, msg_n)
                 if not hit:
                     continue
                 conf = float(getattr(rule, "base_confidence", 0.5) or 0.5)
-                if conf < float(self.MIN_PREDICTION_CONFIDENCE):
+                if conf < _min_conf:
                     continue
                 pr = PredictResult(
                     predicted_state      = str(getattr(rule, "escalated_state", "unknown")),
