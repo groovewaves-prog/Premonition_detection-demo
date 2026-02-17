@@ -288,3 +288,34 @@ class StorageManager:
                 )
                 self._conn.commit()
         except Exception: pass
+
+    # --- Rule Config Seeding ---
+    def _seed_rule_config_from_rules_json(self, rules_data: List[dict]):
+        """
+        rules.json の内容を rule_config テーブルに初期シードする。
+        既存レコードは上書きしない（INSERT OR IGNORE）。
+        engine.py の _load_rules() / repair_db_from_rules_json() から呼び出される。
+        """
+        if not self._conn or not rules_data:
+            return
+        try:
+            with self._db_lock:
+                for item in rules_data:
+                    rp  = str(item.get("pattern", "")).lower()
+                    pt  = float(item.get("paging_threshold")  or 0.40)
+                    lt  = float(item.get("logging_threshold") or 0.35)
+                    rj  = json.dumps(
+                        {k: v for k, v in item.items() if not k.startswith('_')},
+                        ensure_ascii=False
+                    )
+                    if not rp:
+                        continue
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO rule_config "
+                        "(rule_pattern, paging_threshold, logging_threshold, rule_json, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (rp, pt, lt, rj, time.time())
+                    )
+                self._conn.commit()
+        except Exception as e:
+            logger.warning(f"_seed_rule_config_from_rules_json failed: {e}")
