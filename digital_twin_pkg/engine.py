@@ -69,16 +69,16 @@ class DigitalTwinEngine:
         if not loaded_from_db:
             path = self.storage.paths["rules"]
             if not os.path.exists(path):
-                self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES]
-                self.storage.save_json_atomic("rules", [asdict(r) for r in self.rules])
+                self.rules = [EscalationRule(**self._sanitize_rule_data(asdict(r))) for r in DEFAULT_RULES]
+                self.storage.save_json_atomic("rules", [self._sanitize_rule_data(asdict(r)) for r in self.rules])
             else:
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                     self.rules = [EscalationRule(**self._sanitize_rule_data(item)) for item in data]
                 except Exception as e:
-                    self.rules = [EscalationRule(**asdict(r)) for r in DEFAULT_RULES]
-            self.storage._seed_rule_config_from_rules_json([asdict(r) for r in self.rules])
+                    self.rules = [EscalationRule(**self._sanitize_rule_data(asdict(r))) for r in DEFAULT_RULES]
+            self.storage._seed_rule_config_from_rules_json([self._sanitize_rule_data(asdict(r)) for r in self.rules])
         self._metric_rules = [r for r in self.rules if (r.requires_trend or r.requires_volatility) and r.trend_metric_regex]
 
     def _ensure_model_loaded(self):
