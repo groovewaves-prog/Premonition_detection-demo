@@ -245,6 +245,143 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         }]
 
     # =====================================================
+    # ★ Phase1: DigitalTwinEngine.predict_api() 接続
+    # シミュレーション注入 OR 正常シナリオで dt_engine を呼ぶ
+    # =====================================================
+    dt_key = f"dt_engine_{site_id}"
+    dt_engine = st.session_state.get(dt_key)
+    if dt_engine is None:
+        try:
+            from digital_twin_pkg import DigitalTwinEngine as _DTE
+            _children_map: dict = {}
+            for _nid, _n in topology.items():
+                _pid = (_n.get('parent_id') if isinstance(_n, dict)
+                        else getattr(_n, 'parent_id', None))
+                if _pid:
+                    _children_map.setdefault(_pid, []).append(_nid)
+            dt_engine = _DTE(topology=topology, children_map=_children_map, tenant_id=site_id)
+            st.session_state[dt_key] = dt_engine
+        except Exception:
+            dt_engine = None
+
+    # 期限切れ予兆を定期的に解消（rate limit: 5分に1回）
+    _expire_key = f"dt_expire_ts_{site_id}"
+    if dt_engine and (time.time() - st.session_state.get(_expire_key, 0)) > 300:
+        dt_engine.forecast_expire_open()
+        st.session_state[_expire_key] = time.time()
+
+    # =====================================================
+    # ★ 競合検出: 障害シナリオと予兆シミュレーションの排他制御
+    # ─────────────────────────────────────────────────────
+    # 「予兆シミュレーション」の本来の意味:
+    #   正常稼働中に弱いシグナルを注入 → DTが予兆を検知
+    # 障害シナリオ active 時は意味論的に時系列逆転するため排他制御
+    # =====================================================
+    _injected        = st.session_state.get("injected_weak_signal")
+    _scenario_active = (scenario != "正常稼働")
+    _sim_active      = bool(_injected and _injected.get("device_id") in topology)
+
+    # 競合状態: 障害シナリオ中に予兆シミュレーションが注入されている
+    _conflict = _scenario_active and _sim_active
+
+    if _conflict:
+        # 競合デバイスが実障害と重なるか確認
+        _sim_device     = _injected.get("device_id", "")
+        _critical_set   = {a.device_id for a in alarms if a.severity == "CRITICAL"}
+        _warning_set    = {a.device_id for a in alarms if a.severity == "WARNING"}
+        _conflict_level = ("CRITICAL" if _sim_device in _critical_set
+                           else "WARNING" if _sim_device in _warning_set
+                           else "OTHER")
+
+        # 競合警告をUIに表示
+        if _conflict_level in ("CRITICAL", "WARNING"):
+            st.warning(
+                "⚠️ **予兆シミュレーション競合検出**\n\n"
+                f"現在の障害シナリオ「**{scenario}**」により `{_sim_device}` は既に "
+                f"**{_conflict_level}** 状態です。\n"
+                "予兆シミュレーションは **無効化** されています。\n\n"
+                "💡 予兆→障害の流れをデモするには:\n"
+                "1. シナリオを「正常稼働」に戻す\n"
+                "2. 予兆シミュレーションを実行（アンバー色でハイライト）\n"
+                "3. 障害シナリオに切り替えて「予兆が的中した」を確認"
+            )
+        else:
+            # 異なるデバイスへの注入は許容するが注意喚起
+            st.info(
+                f"ℹ️ 障害シナリオ「**{scenario}**」実行中です。\n"
+                f"`{_sim_device}` への予兆シミュレーションは継続しますが、"
+                "forecast_ledger の自動 CONFIRMED 登録は **抑制** されます。"
+            )
+
+    # 注入シグナル OR 実アラームを dt_engine に通して予兆リストを生成
+    dt_predictions: List[dict] = []
+    if dt_engine:
+        _msg_sources = []
+
+        # A) 予兆シミュレーション注入シグナル
+        #    競合かつ同デバイスが障害中の場合は無効化
+        if _sim_active:
+            _sim_dev  = _injected.get("device_id", "")
+            # _critical_set/_warning_set は _conflict=True 時のみ定義済み
+            _alarm_devices = {a.device_id for a in alarms
+                              if a.severity in ("CRITICAL", "WARNING")}
+            _disabled = (_conflict and _sim_dev in _alarm_devices)
+            if not _disabled:
+                _msgs = _injected.get("messages", [_injected.get("message", "")])
+                for _m in _msgs:
+                    if _m:
+                        _msg_sources.append((_sim_dev, _m, "simulation"))
+
+        # B) 実アラームの WARNING/INFO（障害確定前の弱いシグナル）
+        for _a in alarms:
+            if _a.severity in ("WARNING", "INFO") and not _a.is_root_cause:
+                _msg_sources.append((_a.device_id, _a.message, "real"))
+
+        for _dev_id, _msg, _src in _msg_sources:
+            _resp = dt_engine.predict_api({
+                "tenant_id":       site_id,
+                "device_id":       _dev_id,
+                "msg":             _msg,
+                "timestamp":       time.time(),
+                "record_forecast": True,
+                "attrs":           {"source": _src}
+            })
+            if _resp.get("ok"):
+                for _p in _resp.get("predictions", []):
+                    _p["id"]     = _dev_id
+                    _p["source"] = _src
+                    if not any(d.get("id") == _dev_id for d in dt_predictions):
+                        dt_predictions.append(_p)
+
+        # ── 自動 outcome 登録 ──────────────────────────────
+        # Execute 成功済みデバイス → MITIGATED（競合状態に関わらず有効）
+        for _rid, _recovered in list(st.session_state.get("recovered_devices", {}).items()):
+            if _recovered:
+                _auto_key = f"dt_auto_mitigated_{site_id}_{_rid}"
+                if not st.session_state.get(_auto_key):
+                    dt_engine.forecast_auto_resolve(
+                        _rid, "mitigated", note="Execute 成功による自動解消")
+                    st.session_state[_auto_key] = True
+
+        # CRITICAL アラーム確定 → CONFIRMED
+        # ただし競合状態（障害シナリオ active）では抑制して誤自動登録を防ぐ
+        if not _conflict:
+            _critical_devices = {a.device_id for a in alarms if a.severity == "CRITICAL"}
+            for _cd in _critical_devices:
+                _auto_key = f"dt_auto_confirmed_{site_id}_{_cd}"
+                if not st.session_state.get(_auto_key):
+                    dt_engine.forecast_auto_resolve(
+                        _cd, "confirmed_incident",
+                        note="CRITICAL アラームによる自動確定")
+                    st.session_state[_auto_key] = True
+
+    # DT予兆を analysis_results にマージ（既存の is_prediction 結果と重複しない）
+    existing_pred_ids = {r.get("id") for r in analysis_results if r.get("is_prediction")}
+    for _dp in dt_predictions:
+        if _dp.get("id") not in existing_pred_ids:
+            analysis_results.append(_dp)
+
+    # =====================================================
     # KPIメトリクス
     # =====================================================
     root_cause_alarms = [a for a in alarms if a.is_root_cause]
@@ -811,6 +948,37 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 if st.session_state.get("verification_log"):
                     st.markdown("#### 🔎 Post-Fix Verification Logs")
                     st.code(st.session_state.verification_log, language="text")
+
+            # ★ Phase1: 予兆 Outcome 手動登録ボタン（例外修正用）
+            if dt_engine and selected_incident_candidate:
+                _oc_device = selected_incident_candidate.get("id", "")
+                _open_preds = dt_engine.forecast_list_open(device_id=_oc_device)
+                if _open_preds:
+                    st.markdown("---")
+                    st.markdown("##### 🔮 予兆ステータス登録（手動修正）")
+                    st.caption(f"対象機器 `{_oc_device}` の未解決予兆: {len(_open_preds)}件")
+                    _oc1, _oc2, _oc3 = st.columns(3)
+                    _btn_confirm = _oc1.button("✅ 障害確認済み", key="oc_confirm",
+                                               help="予兆が実際に障害に発展した場合")
+                    _btn_mitig   = _oc2.button("🛡️ 抑え込んだ",  key="oc_mitig",
+                                               help="予防対応により障害を回避した場合")
+                    _btn_false   = _oc3.button("❌ 誤検知",       key="oc_false",
+                                               help="予兆が外れた場合")
+                    for _fp in _open_preds:
+                        _fid = _fp.get("forecast_id", "")
+                        if _btn_confirm:
+                            r = dt_engine.forecast_register_outcome(_fid, "confirmed_incident")
+                            if r.get("ok"):
+                                st.success(f"確認済みとして登録: {_fid[:12]} "
+                                           f"({'成功' if r.get('success') else '期限超過'})")
+                        elif _btn_mitig:
+                            r = dt_engine.forecast_register_outcome(_fid, "mitigated")
+                            if r.get("ok"):
+                                st.success(f"抑え込みとして登録: {_fid[:12]}")
+                        elif _btn_false:
+                            r = dt_engine.forecast_register_outcome(_fid, "false_alarm")
+                            if r.get("ok"):
+                                st.info(f"誤検知として登録: {_fid[:12]}")
 
         else:
             # prob <= 0.6 or no candidate
