@@ -1,3 +1,4 @@
+# digital_twin_pkg/rules.py   ―  EscalationRule 定義・DEFAULT_RULES
 import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
