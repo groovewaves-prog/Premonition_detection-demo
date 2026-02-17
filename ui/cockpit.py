@@ -248,9 +248,10 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     # ★ Phase1: DigitalTwinEngine.predict_api() 接続
     # シミュレーション注入 OR 正常シナリオで dt_engine を呼ぶ
     # =====================================================
-    dt_key = f"dt_engine_{site_id}"
-    dt_engine = st.session_state.get(dt_key)
-    if dt_engine is None:
+    dt_key     = f"dt_engine_{site_id}"
+    dt_err_key = f"dt_engine_error_{site_id}"
+    dt_engine  = st.session_state.get(dt_key)
+    if dt_engine is None and not st.session_state.get(dt_err_key):
         try:
             from digital_twin_pkg import DigitalTwinEngine as _DTE
             _children_map: dict = {}
@@ -260,8 +261,11 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 if _pid:
                     _children_map.setdefault(_pid, []).append(_nid)
             dt_engine = _DTE(topology=topology, children_map=_children_map, tenant_id=site_id)
-            st.session_state[dt_key] = dt_engine
-        except Exception:
+            st.session_state[dt_key]     = dt_engine
+            st.session_state[dt_err_key] = None
+        except Exception as _dte_err:
+            import traceback as _tb
+            st.session_state[dt_err_key] = f"{type(_dte_err).__name__}: {_dte_err}\n{_tb.format_exc()}"
             dt_engine = None
 
     # 期限切れ予兆を定期的に解消（rate limit: 5分に1回）
@@ -470,41 +474,87 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             radar_cols = st.columns(min(len(prediction_candidates), 3))
             for idx, pred_item in enumerate(prediction_candidates[:3]):
                 with radar_cols[idx]:
-                    prob_pct = f"{pred_item.get('prob', 0)*100:.0f}%"
-                    pred_timeline = pred_item.get('prediction_timeline', '不明')
-                    pred_affected = pred_item.get('prediction_affected_count', 0)
-                    pred_label = pred_item.get('label', '').replace('🔮 [予兆] ', '')
-                    pred_early_hours = pred_item.get('prediction_early_warning_hours', 0)
+                    prob_pct        = f"{pred_item.get('prob', 0)*100:.0f}%"
+                    confidence      = pred_item.get('confidence', pred_item.get('prob', 0))
+                    pred_timeline   = pred_item.get('prediction_timeline', '不明')
+                    ttc_min         = pred_item.get('prediction_time_to_critical_min',
+                                       pred_item.get('time_to_critical_min', 0))
+                    pred_affected   = pred_item.get('prediction_affected_count', 0)
+                    pred_label      = (pred_item.get('predicted_state')
+                                       or pred_item.get('label', '').replace('🔮 [予兆] ', '')
+                                       or '不明')
+                    pred_early_hours = pred_item.get('prediction_early_warning_hours',
+                                        pred_item.get('early_warning_hours', 0))
+                    rule_pattern    = pred_item.get('rule_pattern', '')
+                    criticality     = pred_item.get('criticality', 'standard')
+                    reasons         = pred_item.get('reasons', [])
+                    rec_actions     = pred_item.get('recommended_actions', [])
+                    source          = pred_item.get('source', 'real')
 
-                    st.error(f"**📍 {pred_item['id']}**")
+                    # ── ヘッダー: 機器名 + 予兆種別 ──────────────
+                    _crit_badge = "🔴 CRITICAL" if criticality == "critical" else "🟠 STANDARD"
+                    _src_badge  = "🔬 シミュ" if source == "simulation" else "📡 実測"
                     st.markdown(
-                        f"<div style='text-align:center;'>"
-                        f"<span style='font-size:36px; font-weight:bold; color:#d32f2f;'>{prob_pct}</span>"
-                        f"<br><span style='color:#666;'>発生確率（急性期: {pred_timeline}）</span>"
-                        f"</div>", unsafe_allow_html=True
+                        f"<div style='background:#FFF8E1;border-left:4px solid #FFB300;"
+                        f"padding:8px 12px;border-radius:4px;margin-bottom:8px;'>"
+                        f"<b>📍 {pred_item['id']}</b>"
+                        f"<span style='float:right;font-size:11px;color:#BF360C;'>"
+                        f"{_crit_badge} {_src_badge}</span></div>",
+                        unsafe_allow_html=True
                     )
-                    st.divider()
-                    st.markdown(f"**予測障害:** {pred_label}")
-                    if pred_early_hours >= 24:
-                        early_display = f"最大 **{pred_early_hours // 24}日前** から検知可能"
-                    elif pred_early_hours > 0:
-                        early_display = f"最大 **{pred_early_hours}時間前** から検知可能"
-                    else:
-                        early_display = "不明"
-                    st.markdown(f"**早期予兆:** {early_display}")
-                    st.markdown(f"**急性期:** 発症後 **{pred_timeline}** に深刻化")
-                    st.markdown(f"**影響範囲:** 配下 **{pred_affected}台** が通信断の恐れ")
 
-                    with st.expander("🔍 検知された予兆 (Weak Signal)"):
-                        st.text(pred_item.get('reason', ''))
-                        factors = pred_item.get('prediction_confidence_factors', {})
-                        if factors:
-                            st.caption(
-                                f"ベース信頼度: {factors.get('base', 0):.2f} / "
-                                f"マッチ品質: {factors.get('match_quality', 0):.2f} / "
-                                f"SPOF: {'Yes' if factors.get('is_spof') else 'No'} / "
-                                f"冗長性: {'Yes' if factors.get('has_redundancy') else 'No'}"
-                            )
+                    # ── 確信度 + タイムライン ─────────────────────
+                    st.markdown(
+                        f"<div style='text-align:center;padding:8px 0;'>"
+                        f"<span style='font-size:40px;font-weight:bold;color:#E65100;'>"
+                        f"{prob_pct}</span>"
+                        f"<br><span style='color:#666;font-size:13px;'>"
+                        f"障害発生確信度</span></div>",
+                        unsafe_allow_html=True
+                    )
+
+                    # ── 予兆詳細カード ─────────────────────────────
+                    st.markdown(
+                        f"<div style='background:#FFF3E0;border-radius:6px;"
+                        f"padding:10px 12px;margin:6px 0;font-size:13px;'>"
+                        f"<b>🔮 予測障害:</b> {pred_label}<br>"
+                        f"<b>⏱️ 急性期まで:</b> "
+                        + (f"<span style='color:#d32f2f;font-weight:bold;'>{ttc_min}分</span>"
+                           if ttc_min > 0 else "<span style='color:#d32f2f'>不明</span>")
+                        + f"<br><b>👁️ 早期検知:</b> "
+                        + (f"{pred_early_hours // 24}日前〜" if pred_early_hours >= 24
+                           else (f"{pred_early_hours}時間前〜" if pred_early_hours > 0 else "不明"))
+                        + (f"<br><b>📡 影響範囲:</b> 配下 <b>{pred_affected}台</b> 通信断リスク"
+                           if pred_affected > 0 else "")
+                        + f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    # ── 検知シグナル ───────────────────────────────
+                    if reasons:
+                        with st.expander("🔍 検知シグナル詳細", expanded=False):
+                            for _r in reasons:
+                                st.caption(f"• {_r}")
+                            if rule_pattern:
+                                st.caption(f"適用ルール: `{rule_pattern}`")
+
+                    # ── 推奨アクション ─────────────────────────────
+                    if rec_actions:
+                        with st.expander("🛠️ 推奨アクション", expanded=True):
+                            for _act in rec_actions:
+                                _title  = _act.get('title', '')
+                                _effect = _act.get('effect', '')
+                                st.markdown(
+                                    f"<div style='background:#E8F5E9;padding:6px 10px;"
+                                    f"border-radius:4px;margin:4px 0;font-size:12px;'>"
+                                    f"✅ <b>{_title}</b>"
+                                    + (f"<br><span style='color:#2e7d32;'>{_effect}</span>"
+                                       if _effect else "")
+                                    + "</div>",
+                                    unsafe_allow_html=True
+                                )
+                    else:
+                        st.caption("推奨アクションなし")
         st.markdown("---")
 
     # =====================================================
