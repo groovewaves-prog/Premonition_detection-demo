@@ -1,4 +1,4 @@
-# ui/cockpit.py  ―  AIOps インシデント・コックピット（Phase1 predict_api 接続・競合検出）
+# ui/cockpit.py  ―  AIOps インシデント・コックピット（Phase1 predict_api 接続・競合検出・確信度動的算出）
 import streamlit as st
 import pandas as pd
 import json
@@ -145,6 +145,90 @@ def _build_ci_context_for_chat(topology: dict, target_node_id: str) -> dict:
         pass
 
     return ci
+
+
+def _sanitize_prediction_context(text: str, max_len: int = 800) -> str:
+    """
+    LLMプロンプト用サニタイズ:
+    - 個人情報・パスワード・IP直書き・制御文字を除去
+    - max_len で切り詰め（プロンプト肥大化防止 → 速度改善）
+    """
+    import re as _re
+    # 制御文字除去
+    text = _re.sub(r'[--]', '', text or "")
+    # パスワード・シークレット系を遮蔽
+    text = _re.sub(r'(?i)(password|passwd|secret|token|api.?key)\s*[=:]\s*\S+', r'=***', text)
+    # プライベートIP は最後オクテットをマスク
+    text = _re.sub(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.)\d{1,3}', r'***', text)
+    return text[:max_len]
+
+
+def _build_prediction_report_scenario(cand: dict, signal_count: int = 1) -> str:
+    """
+    予兆用レポートシナリオを構築（バッチ化: 必要最小フィールドのみ）
+    運用者視点: 「今後N日後に症状が顕著化」表現で統一
+    """
+    dev_id        = cand.get('id', '不明')
+    pred_state    = cand.get('predicted_state') or cand.get('label', '').replace('🔮 [予兆] ', '') or '不明'
+    pred_affected = int(cand.get('prediction_affected_count', 0))
+    early_hours   = int(cand.get('prediction_early_warning_hours', 0))
+    ttc_min       = int(cand.get('prediction_time_to_critical_min', 60))
+    confidence    = float(cand.get('confidence', cand.get('prob', 0.5)))
+    rule_pattern  = cand.get('rule_pattern', '')
+    reasons       = cand.get('reasons', [])
+
+    if early_hours >= 24:
+        early_future = f"今後{early_hours // 24}日後に症状が顕著化する見込み"
+    elif early_hours > 0:
+        early_future = f"今後{early_hours}時間後に症状が顕著化する見込み"
+    else:
+        early_future = "近日中に症状が顕著化する可能性"
+
+    reason_summary = "; ".join(
+        _sanitize_prediction_context(r, 120) for r in reasons[:3]
+    ) if reasons else rule_pattern
+
+    lines = [
+        f"[予兆検知] {dev_id}で障害の前兆を検出（信頼度{confidence*100:.0f}%）。{signal_count}件の微弱シグナルを確認。",
+        f"・予測障害: {pred_state}",
+        f"・予兆進行: {early_future}",
+        f"・急性期: 症状の発症後{ttc_min}分で深刻化する恐れ",
+        f"・影響範囲: 配下{pred_affected}台に通信断リスク",
+        f"・検出シグナル: {reason_summary}",
+        "以下を簡潔に提供してください（各項目3行以内）:",
+        "1.予兆パターン解説 2.確認コマンド 3.判定基準 4.予防措置 5.エスカレーション",
+    ]
+    return "\n".join(lines)
+
+
+def _build_prevention_plan_scenario(cand: dict) -> str:
+    """予防措置プラン用シナリオ（バッチ化・サニタイズ済み）"""
+    dev_id        = cand.get('id', '不明')
+    pred_state    = cand.get('predicted_state') or cand.get('label', '').replace('🔮 [予兆] ', '') or '不明'
+    pred_affected = int(cand.get('prediction_affected_count', 0))
+    ttc_min       = int(cand.get('prediction_time_to_critical_min', 60))
+    early_hours   = int(cand.get('prediction_early_warning_hours', 0))
+    rec_actions   = cand.get('recommended_actions', [])
+
+    if early_hours >= 24:
+        early_ctx = f"今後{early_hours // 24}日後に顕著化"
+    else:
+        early_ctx = f"今後{early_hours}時間後に顕著化" if early_hours > 0 else "近日中"
+
+    actions_txt = ""
+    if rec_actions:
+        actions_txt = " 既知の推奨: " + ", ".join(
+            _sanitize_prediction_context(a.get('title',''), 60) for a in rec_actions[:3])
+
+    lines = [
+        f"[予防措置] {dev_id}の障害予兆に対する予防措置プラン。",
+        f"・予測障害: {pred_state}",
+        f"・顕著化タイミング: {early_ctx}、急性期まで{ttc_min}分",
+        f"・影響範囲: 配下{pred_affected}台{actions_txt}",
+        "「復旧」ではなく「予防措置・事前対応」として簡潔に提示（各手順2行以内）:",
+        "1.即時点検 2.予防コマンド 3.メンテナンス計画 4.監視強化 5.エスカレーション判断基準",
+    ]
+    return "\n".join(lines)
 
 
 def run_diagnostic_simulation_no_llm(scenario: str, target_node_obj) -> dict:
@@ -337,10 +421,25 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     if _m:
                         _msg_sources.append((_sim_dev, _m, "simulation"))
 
+        # degradation_level を sidebar から取得 + デバイス変更時のレポートリセット
+        _sim_level = int((_injected or {}).get("level", 1)) if _sim_active else 1
+        _prev_sim_dev_key = f"dt_prev_sim_device_{site_id}"
+        _cur_sim_dev = (_injected or {}).get("device_id", "")
+        if _cur_sim_dev != st.session_state.get(_prev_sim_dev_key, ""):
+            for _k in [k for k in list(st.session_state.report_cache.keys())
+                       if "analyst" in k and site_id in k]:
+                del st.session_state.report_cache[_k]
+            st.session_state.generated_report   = None
+            st.session_state.remediation_plan   = None
+            st.session_state.verification_log   = None
+            st.session_state[_prev_sim_dev_key] = _cur_sim_dev
+
         # B) 実アラームの WARNING/INFO（障害確定前の弱いシグナル）
         for _a in alarms:
             if _a.severity in ("WARNING", "INFO") and not _a.is_root_cause:
                 _msg_sources.append((_a.device_id, _a.message, "real"))
+
+        _signal_count = len(_msg_sources)
 
         for _dev_id, _msg, _src in _msg_sources:
             _resp = dt_engine.predict_api({
@@ -349,12 +448,45 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 "msg":             _msg,
                 "timestamp":       time.time(),
                 "record_forecast": True,
-                "attrs":           {"source": _src}
+                "attrs":           {
+                    "source":            _src,
+                    "degradation_level": _sim_level if _src == "simulation" else 1,
+                }
             })
             if _resp.get("ok"):
                 for _p in _resp.get("predictions", []):
                     _p["id"]     = _dev_id
                     _p["source"] = _src
+
+                    # ── 影響範囲: topology の直下子ノード数から算出 ──
+                    _p["prediction_affected_count"] = sum(
+                        1 for _nid, _n in topology.items()
+                        if (_n.get('parent_id') if isinstance(_n, dict)
+                            else getattr(_n, 'parent_id', None)) == _dev_id
+                    )
+
+                    # ── 確信度・タイムラインをレベルに応じて動的調整 ──
+                    # base_confidence に level ボーナス（L1:+4% L5:+20%）
+                    _base_conf   = float(_p.get("confidence", 0.5))
+                    _level_boost = min(0.20, _sim_level * 0.04)
+                    _p["confidence"] = round(min(0.99, _base_conf + _level_boost), 2)
+                    _p["prob"]       = _p["confidence"]
+
+                    # time_to_critical_min: レベル↑ほど急性期が短くなる（L1=100% L5=52%）
+                    _base_ttc  = int(_p.get("time_to_critical_min", 60))
+                    _ttc_scale = max(0.4, 1.0 - (_sim_level - 1) * 0.12)
+                    _p["time_to_critical_min"]            = max(10, int(_base_ttc * _ttc_scale))
+                    _p["prediction_time_to_critical_min"] = _p["time_to_critical_min"]
+                    _p["prediction_timeline"]             = f"{_p['time_to_critical_min']}分後"
+
+                    # early_warning_hours: レベル↑ほど早期検知ウィンドウが縮小
+                    _base_ewh = int(_p.get("early_warning_hours", 24))
+                    _p["early_warning_hours"]            = max(1, int(_base_ewh * _ttc_scale))
+                    _p["prediction_early_warning_hours"] = _p["early_warning_hours"]
+
+                    # signal_count（LLMプロンプト用）
+                    _p["prediction_signal_count"] = _signal_count
+
                     if not any(d.get("id") == _dev_id for d in dt_predictions):
                         dt_predictions.append(_p)
 
@@ -385,6 +517,23 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     for _dp in dt_predictions:
         if _dp.get("id") not in existing_pred_ids:
             analysis_results.append(_dp)
+
+    # =====================================================
+    # ★ デバイス変更検知: 予兆シミュ対象が変わったらレポートをリセット
+    # =====================================================
+    _sim_device_now = (_injected.get("device_id") if _injected else None)
+    _sim_device_key = f"dt_last_sim_device_{site_id}"
+    _sim_device_prev = st.session_state.get(_sim_device_key)
+    if _sim_device_now != _sim_device_prev:
+        st.session_state.generated_report   = None
+        st.session_state.remediation_plan   = None
+        st.session_state.verification_log   = None
+        # レポートキャッシュも予兆系のエントリだけ削除
+        _keys_to_del = [k for k in st.session_state.get("report_cache", {})
+                        if "analyst" in k or "remediation" in k]
+        for _k in _keys_to_del:
+            st.session_state.report_cache.pop(_k, None)
+        st.session_state[_sim_device_key] = _sim_device_now
 
     # =====================================================
     # KPIメトリクス
@@ -523,8 +672,8 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         + (f"<span style='color:#d32f2f;font-weight:bold;'>{ttc_min}分</span>"
                            if ttc_min > 0 else "<span style='color:#d32f2f'>不明</span>")
                         + f"<br><b>👁️ 早期検知:</b> "
-                        + (f"{pred_early_hours // 24}日前〜" if pred_early_hours >= 24
-                           else (f"{pred_early_hours}時間前〜" if pred_early_hours > 0 else "不明"))
+                        + (f"今後{pred_early_hours // 24}日後に顕著化" if pred_early_hours >= 24
+                           else (f"今後{pred_early_hours}時間後に顕著化" if pred_early_hours > 0 else "不明"))
                         + (f"<br><b>📡 影響範囲:</b> 配下 <b>{pred_affected}台</b> 通信断リスク"
                            if pred_affected > 0 else "")
                         + f"</div>",
@@ -755,31 +904,11 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                             "children_ids": children_ids
                         }
 
-                        # 予兆の場合はシナリオコンテキストを拡張
+                        # 予兆の場合: バッチ化・サニタイズ済みヘルパーで構築（速度改善）
                         report_scenario = scenario
                         if is_pred:
-                            pred_reason      = cand.get('reason', '')
-                            pred_timeline    = cand.get('prediction_timeline', '不明')
-                            pred_affected    = cand.get('prediction_affected_count', 0)
-                            signal_count     = cand.get('prediction_signal_count', 1)
-                            pred_early_hours = cand.get('prediction_early_warning_hours', 0)
-                            pred_time_crit   = cand.get('prediction_time_to_critical_min', 0)
-                            early_ctx = (f"{pred_early_hours // 24}日前から検知可能なパターン" if pred_early_hours >= 24
-                                         else (f"{pred_early_hours}時間前から検知可能なパターン" if pred_early_hours > 0
-                                               else "早期検知パターン"))
-                            report_scenario = (
-                                f"[予兆検知 - Predictive Maintenance] Digital Twinが{cand['id']}で障害の前兆を検出。\n"
-                                f"現在のステータスは「正常」だが、{signal_count}件の微弱シグナルを検出。\n"
-                                f"・早期予兆: {early_ctx}\n"
-                                f"・急性期進行: 発症後{pred_time_crit}分で深刻化の恐れ\n"
-                                f"・影響範囲: 配下{pred_affected}台に影響の恐れ\n\n"
-                                f"検出されたシグナル:\n{pred_reason}\n\n"
-                                f"1. 検出された予兆パターンの解説\n"
-                                f"2. 手動確認手順（show コマンド等）\n"
-                                f"3. 予兆が障害に発展するか判定するための基準\n"
-                                f"4. 推奨される予防措置とメンテナンス計画\n"
-                                f"5. エスカレーション基準"
-                            )
+                            _sig_count      = cand.get('prediction_signal_count', 1)
+                            report_scenario = _build_prediction_report_scenario(cand, _sig_count)
 
                         cache_key_analyst = "|".join([
                             "analyst", site_id, scenario,
@@ -843,8 +972,8 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 timeline    = selected_incident_candidate.get('prediction_timeline', '不明')
                 affected    = selected_incident_candidate.get('prediction_affected_count', 0)
                 early_hours = selected_incident_candidate.get('prediction_early_warning_hours', 0)
-                early_display = (f"最大 <b>{early_hours // 24}日前</b> から検知可能" if early_hours >= 24
-                                 else (f"最大 <b>{early_hours}時間前</b> から検知可能" if early_hours > 0
+                early_display = (f"今後 <b>{early_hours // 24}日後</b> に症状が顕著化" if early_hours >= 24
+                                 else (f"今後 <b>{early_hours}時間後</b> に症状が顕著化" if early_hours > 0
                                        else "不明"))
                 st.markdown(f"""
                 <div style="background-color:#fff3e0;padding:10px;border-radius:5px;border:1px solid #ff9800;color:#e65100;margin-bottom:10px;">
@@ -880,19 +1009,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
 
                         rem_scenario = scenario
                         if is_pred_rem:
-                            pred_timeline    = selected_incident_candidate.get('prediction_timeline', '不明')
-                            pred_affected    = selected_incident_candidate.get('prediction_affected_count', 0)
-                            pred_early_hours = selected_incident_candidate.get('prediction_early_warning_hours', 0)
-                            pred_time_crit   = selected_incident_candidate.get('prediction_time_to_critical_min', 0)
-                            early_ctx = (f"最大{pred_early_hours // 24}日前から検知可能" if pred_early_hours >= 24
-                                         else (f"最大{pred_early_hours}時間前から検知可能" if pred_early_hours > 0
-                                               else "早期検知パターン"))
-                            rem_scenario = (
-                                f"[予兆対応 - Predictive Maintenance] {selected_incident_candidate['id']}で障害の前兆を検出。\n"
-                                f"・早期予兆: {early_ctx}\n"
-                                f"・急性期: 発症後{pred_time_crit}分に深刻化の恐れ（影響{pred_affected}台）\n\n"
-                                f"「復旧」ではなく「予防措置」として手順を提示してください。"
-                            )
+                            rem_scenario = _build_prevention_plan_scenario(selected_incident_candidate)
 
                         cache_key_rem = "|".join([
                             "remediation", site_id, scenario,
