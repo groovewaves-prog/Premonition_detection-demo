@@ -1,3 +1,4 @@
+# ui/graph.py    ―  トポロジーグラフ描画（Graphviz・予兆アンバーハイライト）
 import graphviz
 from alarm_generator import NodeColor, Alarm
 from typing import List
