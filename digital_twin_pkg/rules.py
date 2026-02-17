@@ -67,7 +67,7 @@ DEFAULT_RULES = [
                    runbook_url="https://wiki.company.com/ops/qos_tuning"),
 
     # 3. Route Instability (経路揺らぎ) -> BGP/OSPF
-    EscalationRule("route_instability", ["bgp.*change", "neighbor.*down", "route updates", "retransmission"], 
+    EscalationRule("route_instability", ["route instability", "bgp neighbor", "neighbor down", "route updates", "retransmission"], 
                    "経路不安定による大規模通信断", 30, 48, 0.90, "Network/Routing", 0.45,
                    recommended_actions=[{"title": "BGPフラップダンピングの確認", "effect": "不安定な経路の抑制"}, {"title": "ルート広報の検証", "effect": "誤った経路情報の修正"}]),
 
