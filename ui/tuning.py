@@ -1,13 +1,5 @@
 """
 ui/tuning.py  ―  Streamlit UI 層（Digital Twin Tuning ダッシュボード）
-
-【重要】
-このファイルは digital_twin_pkg/tuning.py（AutoTuner クラス）とは全くの別物です。
-- ui/tuning.py          : Streamlit 画面描画のみ
-- digital_twin_pkg/tuning.py : ビジネスロジック（AutoTuner）
-
-モジュールレベルで外部パッケージをインポートすると Streamlit Cloud の起動時に
-ImportError が発生するため、すべての外部インポートを関数内に配置しています。
 """
 import streamlit as st
 import pandas as pd
@@ -18,26 +10,25 @@ import os
 def _get_or_init_dt_engine(site_id: str):
     """
     DigitalTwinEngine を取得または初期化して session_state にキャッシュする。
-
-    修正ポイント:
-      - インポートパス: digital_twin_pkg (パッケージ) を使用
-        旧: from digital_twin import DigitalTwinEngine  → ImportError
-        新: from digital_twin_pkg import DigitalTwinEngine  → 正常
-      - すべての外部インポートをこの関数内に閉じ込める
+    例外は握り潰さず session_state["dt_engine_error_{site_id}"] に保存して
+    画面でデバッグ情報を表示できるようにする。
     """
-    dt_key = f"dt_engine_{site_id}"
+    dt_key    = f"dt_engine_{site_id}"
+    err_key   = f"dt_engine_error_{site_id}"
 
     if dt_key in st.session_state:
         return st.session_state[dt_key]
 
     try:
+        # ★ digital_twin_pkg パッケージからインポート
         from digital_twin_pkg import DigitalTwinEngine
         from registry import get_paths, load_topology
 
         paths    = get_paths(site_id)
         topology = load_topology(paths.topology_path)
         if not topology:
-            st.session_state[dt_key] = None
+            st.session_state[dt_key]  = None
+            st.session_state[err_key] = "topology が読み込めませんでした。"
             return None
 
         children_map: dict = {}
@@ -52,14 +43,21 @@ def _get_or_init_dt_engine(site_id: str):
             children_map=children_map,
             tenant_id=site_id,
         )
-        st.session_state[dt_key] = dt_engine
+        st.session_state[dt_key]  = dt_engine
+        st.session_state[err_key] = None
         return dt_engine
 
-    except ImportError:
-        st.session_state[dt_key] = None
+    except ImportError as e:
+        import traceback
+        msg = f"ImportError: {e}\n\n{traceback.format_exc()}"
+        st.session_state[dt_key]  = None
+        st.session_state[err_key] = msg
         return None
-    except Exception:
-        st.session_state[dt_key] = None
+    except Exception as e:
+        import traceback
+        msg = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+        st.session_state[dt_key]  = None
+        st.session_state[err_key] = msg
         return None
 
 
@@ -69,13 +67,17 @@ def render_tuning_dashboard(site_id: str):
     dt_engine = _get_or_init_dt_engine(site_id)
 
     if not dt_engine:
-        st.error(
-            "Digital Twin Engine unavailable. (エンジンモジュールがロードされていません)\n\n"
-            "**確認事項:**\n"
-            "- `digital_twin_pkg/` ディレクトリがプロジェクトルートに存在するか\n"
-            "- `digital_twin_pkg/__init__.py` に "
-            "`from .engine import DigitalTwinEngine` が記述されているか"
-        )
+        err_detail = st.session_state.get(f"dt_engine_error_{site_id}", "不明なエラー")
+        st.error("Digital Twin Engine unavailable. (エンジンモジュールがロードされていません)")
+        with st.expander("🔍 エラー詳細（デバッグ用）", expanded=True):
+            st.code(err_detail or "詳細情報なし", language="text")
+
+        col_retry, _ = st.columns([1, 3])
+        if col_retry.button("🔄 再試行"):
+            for k in [f"dt_engine_{site_id}", f"dt_engine_error_{site_id}"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.rerun()
         return
 
     try:
@@ -87,6 +89,7 @@ def render_tuning_dashboard(site_id: str):
 
     tab1, tab2, tab3 = st.tabs(["⚡ Auto-Tuning", "📜 Audit Log", "🛑 Maintenance"])
 
+    # ── Tab1: Auto-Tuning ──────────────────────────────────
     with tab1:
         st.caption("AIによる閾値自動調整の提案を確認し、適用します。")
 
@@ -112,7 +115,8 @@ def render_tuning_dashboard(site_id: str):
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Recall (再現率)", f"{stats.get('recall', 0):.2f}")
                     c2.metric("New Threshold",   f"{proposal.get('paging_threshold', 0):.2f}")
-                    c3.metric("FP Reduction",    f"-{impact.get('fp_reduction', 0)*100:.0f}%", delta_color="normal")
+                    c3.metric("FP Reduction",    f"-{impact.get('fp_reduction', 0)*100:.0f}%",
+                              delta_color="normal")
                     st.markdown(f"**理由:** {rec.get('shadow_note', '-')}")
                     if rec.get('apply_mode') == 'auto':
                         st.success("✅ Auto-Eligible (推奨)")
@@ -128,6 +132,7 @@ def render_tuning_dashboard(site_id: str):
         else:
             st.info("現在、適用すべき新しい提案はありません。")
 
+    # ── Tab2: Audit Log ────────────────────────────────────
     with tab2:
         st.caption("システムに加えられた変更の監査ログ（SQLite）を表示します。")
         db_path = dt_engine.storage.paths.get("sqlite_db", "")
@@ -151,6 +156,7 @@ def render_tuning_dashboard(site_id: str):
         else:
             st.warning(f"監査データベースが見つかりません。\n\nパス: `{db_path}`")
 
+    # ── Tab3: Maintenance ──────────────────────────────────
     with tab3:
         st.markdown("#### System Maintenance")
         col_m1, col_m2 = st.columns(2)
@@ -169,9 +175,9 @@ def render_tuning_dashboard(site_id: str):
             if st.button("🧹 Cache Clear"):
                 st.cache_data.clear()
                 st.cache_resource.clear()
-                dt_key = f"dt_engine_{site_id}"
-                if dt_key in st.session_state:
-                    del st.session_state[dt_key]
+                for k in [f"dt_engine_{site_id}", f"dt_engine_error_{site_id}"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
                 st.success("キャッシュをクリアしました。次回アクセス時に再初期化されます。")
 
         st.divider()
