@@ -1,3 +1,4 @@
+# ui/cockpit.py  ―  AIOps インシデント・コックピット（Phase1 predict_api 接続・競合検出）
 import streamlit as st
 import pandas as pd
 import json
