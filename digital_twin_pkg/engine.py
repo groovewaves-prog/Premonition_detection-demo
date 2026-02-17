@@ -61,7 +61,7 @@ class PredictResult:
     time_to_critical_min: int  = 60
     early_warning_hours:  int  = 24
 
-    def to_dict(self):
+    def to_dict(self, affected_count: int = 0, source: str = "real"):
         return {
             "predicted_state":      self.predicted_state,
             "confidence":           float(self.confidence),
@@ -75,6 +75,7 @@ class PredictResult:
             "early_warning_hours":  int(self.early_warning_hours),
             # ── cockpit.py 互換フィールド ──────────────────────
             "is_prediction":        True,
+            "source":               source,
             "prob":                 float(self.confidence),
             "label":                f"🔮 [予兆] {self.predicted_state}",
             "type":                 f"Predictive/{self.category}",
@@ -82,6 +83,7 @@ class PredictResult:
             "prediction_timeline":  f"{self.time_to_critical_min}分後",
             "prediction_time_to_critical_min": int(self.time_to_critical_min),
             "prediction_early_warning_hours":  int(self.early_warning_hours),
+            "prediction_affected_count":       int(affected_count),
         }
 
 
@@ -355,12 +357,16 @@ class DigitalTwinEngine:
         return hit, reasons
 
     def predict(self, device_id: str, msg: str, timestamp: float,
-                attrs: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                attrs: Optional[Dict[str, Any]] = None,
+                degradation_level: int = 1,
+                source: str = "real") -> List[Dict[str, Any]]:
         """
         EscalationRule ベースの予兆予測。
+        degradation_level (1-5): Level に応じて confidence をブースト、
+                                  time_to_critical を短縮、early_warning を延長。
+        source: "simulation" | "real"
         戻り値は PredictResult.to_dict() のリスト（confidence 降順）。
         """
-        # _normalize_msg はオプション（存在しない場合はそのまま使用）
         try:
             msg_n = self._normalize_msg(msg or "")
         except AttributeError:
@@ -371,8 +377,23 @@ class DigitalTwinEngine:
         if self._should_ignore(msg_n):
             return []
 
-        # MIN_PREDICTION_CONFIDENCE は config 定数（self.属性ではない）
         _min_conf = float(MIN_PREDICTION_CONFIDENCE)
+
+        # Level ブースト係数（Level1=0.0 → Level5=0.20）
+        _level = max(1, min(5, int(degradation_level or 1)))
+        _conf_boost    = (_level - 1) * 0.05          # +0.00〜+0.20
+        _ttc_factor    = 1.0 - (_level - 1) * 0.12   # ×1.0〜×0.52（短縮）
+        _early_factor  = 1.0 + (_level - 1) * 0.20   # ×1.0〜×1.80（延長）
+
+        # 影響範囲: children_map から再帰的に配下デバイス数を算出
+        def _count_children(dev_id: str, visited=None) -> int:
+            if visited is None: visited = set()
+            if dev_id in visited: return 0
+            visited.add(dev_id)
+            children = (self.children_map or {}).get(dev_id, [])
+            return len(children) + sum(_count_children(c, visited) for c in children)
+
+        _affected_count = _count_children(device_id)
 
         results = []
         for rule in (self.rules or []):
@@ -380,9 +401,14 @@ class DigitalTwinEngine:
                 hit, reasons = self._rule_match_simple(rule, msg_n)
                 if not hit:
                     continue
-                conf = float(getattr(rule, "base_confidence", 0.5) or 0.5)
+                base_conf = float(getattr(rule, "base_confidence", 0.5) or 0.5)
+                conf = min(0.99, base_conf + _conf_boost)
                 if conf < _min_conf:
                     continue
+                _base_ttc   = int(getattr(rule, "time_to_critical_min", 60) or 60)
+                _base_early = int(getattr(rule, "early_warning_hours", 24) or 24)
+                _ttc   = max(5,  int(_base_ttc   * _ttc_factor))
+                _early = max(1,  int(_base_early * _early_factor))
                 pr = PredictResult(
                     predicted_state      = str(getattr(rule, "escalated_state", "unknown")),
                     confidence           = conf,
@@ -392,14 +418,14 @@ class DigitalTwinEngine:
                     recommended_actions  = list(getattr(rule, "recommended_actions", []) or []),
                     runbook_url          = str(getattr(rule, "runbook_url", "") or ""),
                     criticality          = str(getattr(rule, "criticality", "standard") or "standard"),
-                    time_to_critical_min = int(getattr(rule, "time_to_critical_min", 60) or 60),
-                    early_warning_hours  = int(getattr(rule, "early_warning_hours", 24) or 24),
+                    time_to_critical_min = _ttc,
+                    early_warning_hours  = _early,
                 )
                 results.append(pr)
             except Exception:
                 continue
         results.sort(key=lambda x: x.confidence, reverse=True)
-        return [r.to_dict() for r in results]
+        return [r.to_dict(affected_count=_affected_count, source=source) for r in results]
 
     def predict_api(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -421,7 +447,10 @@ class DigitalTwinEngine:
 
             req   = PredictRequest(tenant_id=tenant_id, device_id=device_id,
                                    msg=msg, timestamp=ts, attrs=attrs)
-            preds = self.predict(device_id=device_id, msg=msg, timestamp=ts, attrs=attrs)
+            _level  = int((attrs or {}).get("degradation_level", 1))
+            _source = str((attrs or {}).get("source", "real"))
+            preds = self.predict(device_id=device_id, msg=msg, timestamp=ts,
+                                 attrs=attrs, degradation_level=_level, source=_source)
 
             record_forecast = bool(request.get("record_forecast", True))
             forecast_ids: List[str] = []
