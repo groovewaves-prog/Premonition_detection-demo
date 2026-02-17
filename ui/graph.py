@@ -28,8 +28,12 @@ def render_topology_graph(topology: dict, alarms: List[Alarm], analysis_results:
         if severity_order.get(a.severity, 0) > severity_order.get(info['max_severity'], 0):
             info['max_severity'] = a.severity
     
-    # 予兆検知IDのセット
-    predicted_ids = {r['id'] for r in analysis_results if r.get('is_prediction')}
+    # 予兆検知IDのセット（DT予兆）
+    predicted_ids_real = {r['id'] for r in analysis_results
+                          if r.get('is_prediction') and r.get('source') != 'simulation'}
+    predicted_ids_sim  = {r['id'] for r in analysis_results
+                          if r.get('is_prediction') and r.get('source') == 'simulation'}
+    predicted_ids = predicted_ids_real | predicted_ids_sim
     
     for node_id, node in topology.items():
         # 型チェックを厳密に行いAttributeErrorを回避
@@ -51,12 +55,20 @@ def render_topology_graph(topology: dict, alarms: List[Alarm], analysis_results:
         if redundancy_type:
             label += f"\n[{redundancy_type}]"
             
-        # 1. 予兆（薄紫色）
-        if node_id in predicted_ids:
-            color = "#E1BEE7"
+        # 1. 予兆ハイライト
+        #    実予兆: #FFB300（アンバー）  ← サイレント障害(#e1bee7 紫)と明確に区別
+        #    シミュ予兆: #FFE082（薄アンバー） ← シミュレーション由来を明示
+        #    ※ サイレント障害は NodeColor.SILENT_FAILURE="#e1bee7"（紫）のまま維持
+        if node_id in predicted_ids_real:
+            color = "#FFB300"       # アンバー（実予兆）
             penwidth = "4"
-            fontcolor = "#4A148C"
+            fontcolor = "#E65100"
             label += "\n🔮 [PREDICTION]"
+        elif node_id in predicted_ids_sim:
+            color = "#FFE082"       # 薄アンバー（シミュ予兆）
+            penwidth = "3"
+            fontcolor = "#BF360C"
+            label += "\n🔬 [SIM-PRED]"
 
         # 2. アラームに基づく上書き（以前の仕様）
         if node_id in alarm_map:
