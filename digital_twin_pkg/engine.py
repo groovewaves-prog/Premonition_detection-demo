@@ -214,6 +214,281 @@ class DigitalTwinEngine:
         if is_spof: confidence *= 1.1
         return min(0.99, max(0.1, confidence))
 
+    def _sanitize_for_llm(self, text: str) -> str:
+        """
+        LLM送信前のデータサニタイズ
+        
+        - IPアドレスのマスキング
+        - プライベート情報の除去
+        - 機密情報の匿名化
+        """
+        import re
+        
+        sanitized = text
+        
+        # IPv4アドレスのマスキング
+        sanitized = re.sub(
+            r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b',
+            'IP_MASKED',
+            sanitized
+        )
+        
+        # IPv6アドレスのマスキング
+        sanitized = re.sub(
+            r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b',
+            'IPV6_MASKED',
+            sanitized
+        )
+        
+        # MACアドレスのマスキング
+        sanitized = re.sub(
+            r'\b(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}\b',
+            'MAC_MASKED',
+            sanitized
+        )
+        
+        # ホスト名の一般化（prod-, dev-, test-などを除去）
+        sanitized = re.sub(
+            r'\b(prod|dev|test|stage|staging)-[\w-]+',
+            'HOSTNAME_MASKED',
+            sanitized,
+            flags=re.IGNORECASE
+        )
+        
+        # ASN (AS番号)のマスキング
+        sanitized = re.sub(
+            r'\bAS\d+\b',
+            'AS_MASKED',
+            sanitized
+        )
+        
+        # VLAN IDのマスキング
+        sanitized = re.sub(
+            r'\bVLAN\s*\d+\b',
+            'VLAN_MASKED',
+            sanitized,
+            flags=re.IGNORECASE
+        )
+        
+        return sanitized
+
+    def _batch_generate_llm_recommendations(
+        self,
+        candidates: set,
+        msg_map: Dict[str, List[str]]
+    ) -> Dict[str, List[Dict[str, str]]]:
+        """
+        複数デバイスの推奨アクションをバッチ生成（コスト削減・性能向上）
+        
+        同じルールパターンの予兆をグループ化し、1回のLLM呼び出しで処理
+        
+        Args:
+            candidates: 予兆候補デバイスIDのセット
+            msg_map: デバイスID → アラームメッセージのマップ
+        
+        Returns:
+            ルールパターン → 推奨アクションのマップ
+        """
+        from collections import defaultdict
+        
+        # ルールパターンでグループ化
+        pattern_groups = defaultdict(list)
+        
+        for dev_id in candidates:
+            messages = msg_map.get(dev_id, [])
+            if not messages:
+                continue
+            
+            # 主要ルールを特定
+            matched_signals = []
+            for msg in messages:
+                rule, quality = self._match_rule(msg)
+                if rule and quality >= 0.30 and rule.pattern != "generic_error":
+                    matched_signals.append((rule, quality, msg))
+            
+            if not matched_signals:
+                rule, quality = self._match_rule(messages[0])
+                if not rule:
+                    continue
+                matched_signals = [(rule, quality, messages[0])]
+            
+            matched_signals.sort(key=lambda x: x[1], reverse=True)
+            primary_rule, primary_quality, primary_msg = matched_signals[0]
+            
+            pattern_groups[primary_rule.pattern].append({
+                'device_id': dev_id,
+                'messages': [s[2] for s in matched_signals[:3]],
+                'affected_count': len(matched_signals),
+                'confidence': self._calculate_confidence(primary_rule, dev_id, primary_quality)
+            })
+        
+        # バッチLLM呼び出し
+        llm_cache = {}
+        WIDE_RANGE_THRESHOLD = 5
+        
+        for pattern, devices in pattern_groups.items():
+            total_affected = sum(d['affected_count'] for d in devices)
+            
+            # 広範囲障害の場合のみLLM呼び出し
+            if total_affected >= WIDE_RANGE_THRESHOLD:
+                # 代表的なデバイスのデータを使用
+                representative = max(devices, key=lambda d: d['affected_count'])
+                
+                llm_actions = self._generate_actions_with_gemini(
+                    rule_pattern=pattern,
+                    affected_count=total_affected,
+                    confidence=sum(d['confidence'] for d in devices) / len(devices),
+                    messages=representative['messages'],
+                    device_id=representative['device_id']
+                )
+                
+                if llm_actions:
+                    llm_cache[pattern] = llm_actions
+                    logger.info(f"Batch LLM: Generated actions for {pattern} "
+                              f"({len(devices)} devices, {total_affected} total affected)")
+        
+        return llm_cache
+
+    def _generate_actions_with_gemini(
+        self,
+        rule_pattern: str,
+        affected_count: int,
+        confidence: float,
+        messages: List[str],
+        device_id: str
+    ) -> Optional[List[Dict[str, str]]]:
+        """
+        Gemini API を使って状況に応じた推奨アクションを動的生成
+        
+        ⚠️ セキュリティ: データをサニタイズしてから送信
+        
+        Args:
+            rule_pattern: 検出されたルールパターン
+            affected_count: 影響を受けたコンポーネント数
+            confidence: 予測信頼度
+            messages: アラームメッセージのリスト
+            device_id: デバイスID
+        
+        Returns:
+            推奨アクションのリスト、または None（生成失敗時）
+        """
+        try:
+            import google.generativeai as genai
+            import os
+            import json
+            
+            # ★ LLM送信の設定確認（オプトアウト可能）
+            enable_llm = os.environ.get("ENABLE_LLM_RECOMMENDATIONS", "true").lower()
+            if enable_llm not in ["true", "1", "yes"]:
+                logger.info("LLM recommendations disabled by configuration")
+                return None
+            
+            # API キーの取得
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                logger.warning("GEMINI_API_KEY not found. Using static recommendations.")
+                return None
+            
+            # ★ データのサニタイズ（機密情報の除去）
+            sanitized_device_id = self._sanitize_for_llm(device_id)
+            sanitized_messages = [self._sanitize_for_llm(msg) for msg in messages[:3]]
+            
+            # Gemini API の設定
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            
+            # デバイスタイプの推定（一般化）
+            device_type = "Network Device"
+            if "ROUTER" in device_id.upper():
+                device_type = "Router"
+            elif "SWITCH" in device_id.upper():
+                device_type = "Switch"
+            elif "FIREWALL" in device_id.upper():
+                device_type = "Firewall"
+            
+            # ★ プロンプトの生成（サニタイズ済みデータのみ使用）
+            prompt = f"""あなたはネットワーク機器の障害対応エキスパートです。
+
+【検出された予兆】
+- デバイスタイプ: {device_type}
+- 検出パターン: {rule_pattern}
+- 影響範囲: {affected_count}個のコンポーネント
+- 予測信頼度: {confidence * 100:.0f}%
+- アラームパターン（匿名化済み）:
+{chr(10).join(f"  - {msg[:150]}" for msg in sanitized_messages)}
+
+【重要な状況分析】
+{affected_count}個のコンポーネントで同時に{rule_pattern}パターンが検出されました。
+これは単発故障では説明困難な広範囲障害です。
+
+【タスク】
+以下の観点で、優先順位順に3-5個の推奨アクションを生成してください：
+
+1. **真因の特定**
+   - 広範囲障害（{affected_count}個）の真因を推論
+   - 電源系統、ファームウェア、環境要因を考慮
+
+2. **優先順位付け**
+   - high: 真因の可能性が高く、影響が大きい
+   - medium: 確認すべきだが影響は中程度
+   - low: 最後の手段、または個別対応
+
+3. **具体性**
+   - 実際に実行可能な手順を提案
+   - 一般的なネットワーク機器のコマンド例を含める
+
+【出力形式】
+JSON形式で出力してください（他の文字は一切含めない）：
+
+[
+  {{
+    "title": "具体的なアクション名",
+    "effect": "期待される効果",
+    "priority": "high/medium/low",
+    "rationale": "このアクションを推奨する根拠",
+    "steps": "実行手順（オプション）"
+  }}
+]
+
+**JSON以外の文字を含めないでください**
+**機密情報（IPアドレス、ホスト名など）を含めないでください**"""
+
+            # Gemini API 呼び出し
+            logger.info(f"Calling Gemini API for {affected_count} affected components")
+            response = model.generate_content(prompt)
+            response_text = response.text.strip()
+            
+            # JSON パース
+            # Markdown コードブロックを除去
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            actions = json.loads(response_text)
+            
+            # バリデーション
+            if not isinstance(actions, list):
+                logger.warning("Gemini API returned invalid format (not a list)")
+                return None
+            
+            # 必須フィールドの確認
+            validated_actions = []
+            for action in actions:
+                if all(k in action for k in ["title", "effect", "priority", "rationale"]):
+                    validated_actions.append(action)
+            
+            if validated_actions:
+                logger.info(f"Generated {len(validated_actions)} actions using Gemini API")
+                return validated_actions
+            else:
+                logger.warning("No valid actions in Gemini API response")
+                return None
+        
+        except Exception as e:
+            logger.warning(f"Failed to generate actions with Gemini API: {e}")
+            return None
+
     def _generate_smart_recommendations(
         self,
         rule_pattern: str,
@@ -221,12 +496,16 @@ class DigitalTwinEngine:
         confidence: float,
         messages: List[str],
         device_id: str,
-        base_actions: List[Dict[str, str]]
+        base_actions: List[Dict[str, str]],
+        llm_cache: Optional[Dict[str, List[Dict[str, str]]]] = None
     ) -> List[Dict[str, str]]:
         """
         LLMを使って状況に応じた推奨アクションを動的生成
         
         広範囲障害の場合は真因（電源/ファームウェア/環境）を推論
+        
+        Args:
+            llm_cache: バッチ生成された推奨アクションのキャッシュ
         """
         # 広範囲障害の閾値
         WIDE_RANGE_THRESHOLD = 5
@@ -235,9 +514,25 @@ class DigitalTwinEngine:
         if affected_count < WIDE_RANGE_THRESHOLD:
             return base_actions
         
-        # LLMベースの推奨アクション生成（実装は後で追加）
-        # ここでは、広範囲障害に対する標準的な対応を返す
+        # ★ キャッシュから取得（バッチ生成済み）
+        if llm_cache and rule_pattern in llm_cache:
+            logger.debug(f"Using cached LLM recommendations for {rule_pattern}")
+            return llm_cache[rule_pattern]
         
+        # ★ キャッシュになければ個別にGemini API呼び出し（フォールバック）
+        llm_actions = self._generate_actions_with_gemini(
+            rule_pattern=rule_pattern,
+            affected_count=affected_count,
+            confidence=confidence,
+            messages=messages,
+            device_id=device_id
+        )
+        
+        if llm_actions:
+            # LLM生成が成功した場合はそれを返す
+            return llm_actions
+        
+        # LLM生成が失敗した場合はフォールバック（静的な高度なアクション）
         enhanced_actions = []
         
         if "optical" in rule_pattern:
@@ -346,6 +641,12 @@ class DigitalTwinEngine:
         candidates = (warning_ids.union(active_ids)) - critical_ids
         processed_devices = set()
         multi_signal_boost = 0.05
+        
+        # ★ バッチLLM推奨アクション生成（コスト削減・性能向上）
+        llm_recommendations_cache = self._batch_generate_llm_recommendations(
+            candidates=candidates,
+            msg_map=msg_map
+        )
 
         for dev_id in candidates:
             if dev_id in processed_devices: continue
@@ -418,7 +719,8 @@ class DigitalTwinEngine:
                 confidence=confidence,
                 messages=[s[2] for s in matched_signals[:3]],
                 device_id=dev_id,
-                base_actions=primary_rule.recommended_actions
+                base_actions=primary_rule.recommended_actions,
+                llm_cache=llm_recommendations_cache  # ★ バッチ生成されたキャッシュを使用
             )
             
             pred = {
