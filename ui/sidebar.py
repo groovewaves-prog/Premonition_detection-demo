@@ -317,20 +317,22 @@ def _render_weak_signal_injection():
             _prev_injected = st.session_state.get("injected_weak_signal")
             if _prev_injected and _prev_injected.get("device_id") == target_device:
                 # 同じデバイスで連続実行 → forecast_ledger をクリア
-                dt_key = f"dt_engine_{active_site}"
-                if dt_key in st.session_state:
-                    dt_engine = st.session_state[dt_key]
-                    # simulation sourceの予兆を削除
-                    try:
-                        if dt_engine and dt_engine.storage._conn:
-                            with dt_engine.storage._db_lock:
-                                dt_engine.storage._conn.execute("""
-                                    DELETE FROM forecast_ledger
-                                    WHERE device_id=? AND status='open' AND source='simulation'
-                                """, (target_device,))
-                                dt_engine.storage._conn.commit()
-                    except Exception as e:
-                        pass  # エラーは無視
+                _active_site = st.session_state.get("active_site")
+                if _active_site:
+                    dt_key = f"dt_engine_{_active_site}"
+                    if dt_key in st.session_state:
+                        dt_engine = st.session_state[dt_key]
+                        # simulation sourceの予兆を削除
+                        try:
+                            if dt_engine and dt_engine.storage._conn:
+                                with dt_engine.storage._db_lock:
+                                    dt_engine.storage._conn.execute("""
+                                        DELETE FROM forecast_ledger
+                                        WHERE device_id=? AND status='open' AND source='simulation'
+                                    """, (target_device,))
+                                    dt_engine.storage._conn.commit()
+                        except Exception:
+                            pass  # エラーは無視
             
             st.session_state["injected_weak_signal"] = {
                 "device_id": target_device,
