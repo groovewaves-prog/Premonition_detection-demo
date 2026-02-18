@@ -361,6 +361,30 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     dt_key     = f"dt_engine_{site_id}"
     dt_err_key = f"dt_engine_error_{site_id}"
     dt_engine  = st.session_state.get(dt_key)
+
+    # ★ 壊れたエンジン(ロック取得不可)の検出とリセット
+    if dt_engine is not None:
+        try:
+            # ノンブロッキングで_db_lockの取得を試みる
+            # 取得できない場合はエンジンが壊れている(デッドロック状態)
+            _lock_acquired = dt_engine.storage._db_lock.acquire(blocking=False)
+            if _lock_acquired:
+                dt_engine.storage._db_lock.release()
+            else:
+                # ロック取得失敗 → エンジンがデッドロック状態 → リセット
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    f"[dt_engine] {site_id}: DB lock deadlock detected. Resetting engine.")
+                st.session_state[dt_key] = None
+                st.session_state[dt_err_key] = None
+                # dt_auto_confirmed / dt_auto_mitigated もクリアして再確認できるようにする
+                for _k in [k for k in list(st.session_state.keys())
+                           if k.startswith(f"dt_auto_") and site_id in k]:
+                    del st.session_state[_k]
+                dt_engine = None
+        except Exception:
+            pass
+
     if dt_engine is None and not st.session_state.get(dt_err_key):
         try:
             from digital_twin_pkg import DigitalTwinEngine as _DTE
