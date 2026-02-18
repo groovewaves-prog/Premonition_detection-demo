@@ -5,7 +5,13 @@ import re
 from enum import Enum
 from typing import List, Dict, Any, Optional
 
-import google.generativeai as genai
+import google.generativeai as genai  # 旧SDK互換（後方互換のため残す）
+try:
+    from google import genai as _new_genai
+    _USE_NEW_SDK = True
+except ImportError:
+    _new_genai = None
+    _USE_NEW_SDK = False
 
 # --- Digital Twin Integration (V45 Package) ---
 try:
@@ -117,8 +123,14 @@ class LogicalRCA:
         if not api_key:
             return False
         try:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel("gemma-3-12b-it")
+            if _USE_NEW_SDK and _new_genai:
+                # 新SDK: Client ベース
+                self._genai_client = _new_genai.Client(api_key=api_key)
+                self.model = None  # 新SDKではmodelオブジェクト不要
+            else:
+                # 旧SDK互換フォールバック
+                genai.configure(api_key=api_key)
+                self.model = genai.GenerativeModel("gemma-3-12b-it")
             self._api_configured = True
             return True
         except Exception as e:
