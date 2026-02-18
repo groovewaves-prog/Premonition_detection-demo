@@ -1284,7 +1284,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                 _created_raw = _fp.get("created_at", 0)
                                 _ttf_hours = _fp.get("time_to_failure_hours", 0)
                                 _failure_dt = _fp.get("predicted_failure_datetime", "")
-                                _source_msg = _fp.get("source", "")
+                                _source_msg = _fp.get("message", "")  # input_jsonから抽出したメッセージ
                                 
                                 # ★ コンポーネント名を抽出（#1の代わりに表示）
                                 _component = _extract_component(_source_msg)
