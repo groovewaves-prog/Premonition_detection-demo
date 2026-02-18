@@ -62,6 +62,13 @@ def render_sidebar():
                             "予兆シミュレーションを自動的にクリアしました。"
                         )
                     
+                    # ★ シナリオ変更時はdt_auto_confirmed/mitigated キーをクリア
+                    # (前シナリオの確認済みフラグが残ると次回 forecast_auto_resolve が走らない)
+                    _auto_keys = [k for k in list(st.session_state.keys())
+                                  if k.startswith("dt_auto_") and site_id in k]
+                    for _k in _auto_keys:
+                        del st.session_state[_k]
+                    
                     # キャッシュクリア
                     keys_to_remove = [k for k in list(st.session_state.report_cache.keys()) if site_id in k]
                     for k in keys_to_remove:
