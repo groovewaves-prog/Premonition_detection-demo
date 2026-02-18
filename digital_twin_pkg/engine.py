@@ -773,20 +773,31 @@ class DigitalTwinEngine:
                 if device_id:
                     cur.execute("""
                         SELECT forecast_id, created_at, device_id, rule_pattern,
-                               predicted_state, confidence, eval_deadline_ts, source
+                               predicted_state, confidence, eval_deadline_ts, source, input_json
                         FROM forecast_ledger
                         WHERE status='open' AND device_id=?
                         ORDER BY created_at DESC LIMIT ?""", (device_id, limit))
                 else:
                     cur.execute("""
                         SELECT forecast_id, created_at, device_id, rule_pattern,
-                               predicted_state, confidence, eval_deadline_ts, source
+                               predicted_state, confidence, eval_deadline_ts, source, input_json
                         FROM forecast_ledger
                         WHERE status='open'
                         ORDER BY confidence DESC, created_at DESC LIMIT ?""", (limit,))
                 rows = cur.fetchall() or []
             keys = ["forecast_id","created_at","device_id","rule_pattern",
-                    "predicted_state","confidence","eval_deadline_ts","source"]
-            return [dict(zip(keys, r)) for r in rows]
+                    "predicted_state","confidence","eval_deadline_ts","source","input_json"]
+            result = []
+            for r in rows:
+                d = dict(zip(keys, r))
+                # input_jsonからログメッセージを抽出
+                try:
+                    if d.get("input_json"):
+                        input_data = json.loads(d["input_json"])
+                        d["message"] = input_data.get("msg", "")
+                except Exception:
+                    d["message"] = ""
+                result.append(d)
+            return result
         except Exception:
             return []
