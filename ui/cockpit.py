@@ -1,4 +1,4 @@
-# ui/cockpit.py  ―  AIOps インシデント・コックピット（Phase1 predict_api 接続・競合検出・確信度動的算出）
+# ui/cockpit.py  ―  AIOps インシデント・コックピット（Phase1 predict_api + RUL予測表示）
 import streamlit as st
 import pandas as pd
 import json
@@ -165,34 +165,40 @@ def _sanitize_prediction_context(text: str, max_len: int = 800) -> str:
 
 def _build_prediction_report_scenario(cand: dict, signal_count: int = 1) -> str:
     """
-    予兆用レポートシナリオを構築（バッチ化: 必要最小フィールドのみ）
-    運用者視点: 「今後N日後に症状が顕著化」表現で統一
+    予兆用レポートシナリオを構築（RUL予測ベース）
+    運用者視点: 「今後N日後に障害発生」表現で統一
     """
     dev_id        = cand.get('id', '不明')
     pred_state    = cand.get('predicted_state') or cand.get('label', '').replace('🔮 [予兆] ', '') or '不明'
     pred_affected = int(cand.get('prediction_affected_count', 0))
-    early_hours   = int(cand.get('prediction_early_warning_hours', 0))
+    ttf_hours     = int(cand.get('prediction_time_to_failure_hours', 0))
+    failure_dt    = cand.get('prediction_failure_datetime', '')
     ttc_min       = int(cand.get('prediction_time_to_critical_min', 60))
     confidence    = float(cand.get('confidence', cand.get('prob', 0.5)))
     rule_pattern  = cand.get('rule_pattern', '')
     reasons       = cand.get('reasons', [])
 
-    if early_hours >= 24:
-        early_future = f"今後{early_hours // 24}日後に症状が顕著化する見込み"
-    elif early_hours > 0:
-        early_future = f"今後{early_hours}時間後に症状が顕著化する見込み"
+    # RUL表示: 今後N日後に障害発生
+    if ttf_hours >= 24:
+        ttf_display = f"今後{ttf_hours // 24}日後に障害発生の見込み"
+        if failure_dt:
+            ttf_display += f"（{failure_dt}頃）"
+    elif ttf_hours > 0:
+        ttf_display = f"今後{ttf_hours}時間後に障害発生の見込み"
+        if failure_dt:
+            ttf_display += f"（{failure_dt}頃）"
     else:
-        early_future = "近日中に症状が顕著化する可能性"
+        ttf_display = "障害が切迫しています"
 
     reason_summary = "; ".join(
         _sanitize_prediction_context(r, 120) for r in reasons[:3]
     ) if reasons else rule_pattern
 
     lines = [
-        f"[予兆検知] {dev_id}で障害の前兆を検出（信頼度{confidence*100:.0f}%）。{signal_count}件の微弱シグナルを確認。",
+        f"[RUL予測] {dev_id}で障害の前兆を検出（信頼度{confidence*100:.0f}%）。{signal_count}件の微弱シグナルを確認。",
         f"・予測障害: {pred_state}",
-        f"・予兆進行: {early_future}",
-        f"・急性期: 症状の発症後{ttc_min}分で深刻化する恐れ",
+        f"・障害発生予測: {ttf_display}",
+        f"・急性期進行: 症状発症後{ttc_min}分でサービス断に至る恐れ",
         f"・影響範囲: 配下{pred_affected}台に通信断リスク",
         f"・検出シグナル: {reason_summary}",
         "以下を簡潔に提供してください（各項目3行以内）:",
@@ -202,18 +208,22 @@ def _build_prediction_report_scenario(cand: dict, signal_count: int = 1) -> str:
 
 
 def _build_prevention_plan_scenario(cand: dict) -> str:
-    """予防措置プラン用シナリオ（バッチ化・サニタイズ済み）"""
+    """予防措置プラン用シナリオ（RUL予測ベース）"""
     dev_id        = cand.get('id', '不明')
     pred_state    = cand.get('predicted_state') or cand.get('label', '').replace('🔮 [予兆] ', '') or '不明'
     pred_affected = int(cand.get('prediction_affected_count', 0))
     ttc_min       = int(cand.get('prediction_time_to_critical_min', 60))
-    early_hours   = int(cand.get('prediction_early_warning_hours', 0))
+    ttf_hours     = int(cand.get('prediction_time_to_failure_hours', 0))
+    failure_dt    = cand.get('prediction_failure_datetime', '')
     rec_actions   = cand.get('recommended_actions', [])
 
-    if early_hours >= 24:
-        early_ctx = f"今後{early_hours // 24}日後に顕著化"
+    # RUL表示
+    if ttf_hours >= 24:
+        ttf_ctx = f"今後{ttf_hours // 24}日後に障害発生"
+        if failure_dt:
+            ttf_ctx += f"（{failure_dt}頃）"
     else:
-        early_ctx = f"今後{early_hours}時間後に顕著化" if early_hours > 0 else "近日中"
+        ttf_ctx = f"今後{ttf_hours}時間後に障害発生" if ttf_hours > 0 else "障害が切迫"
 
     actions_txt = ""
     if rec_actions:
@@ -223,14 +233,13 @@ def _build_prevention_plan_scenario(cand: dict) -> str:
     lines = [
         f"[予防措置] {dev_id}の障害予兆に対する予防措置プラン。",
         f"・予測障害: {pred_state}",
-        f"・顕著化タイミング: {early_ctx}、急性期まで{ttc_min}分",
+        f"・障害発生予測: {ttf_ctx}",
+        f"・急性期進行: 症状発症後{ttc_min}分でサービス断",
         f"・影響範囲: 配下{pred_affected}台{actions_txt}",
         "「復旧」ではなく「予防措置・事前対応」として簡潔に提示（各手順2行以内）:",
         "1.即時点検 2.予防コマンド 3.メンテナンス計画 4.監視強化 5.エスカレーション判断基準",
     ]
     return "\n".join(lines)
-
-
 def run_diagnostic_simulation_no_llm(scenario: str, target_node_obj) -> dict:
     """LLMを呼ばない疑似診断"""
     device_id = getattr(target_node_obj, "id", "UNKNOWN") if target_node_obj else "UNKNOWN"
@@ -455,36 +464,12 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             })
             if _resp.get("ok"):
                 for _p in _resp.get("predictions", []):
+                    # ── engine の計算結果を信頼し、上書きしない ──
+                    # engine は degradation_level に応じて confidence/ttc/early を調整済み
+                    # 再帰的な children_map から affected_count も算出済み
                     _p["id"]     = _dev_id
                     _p["source"] = _src
-
-                    # ── 影響範囲: topology の直下子ノード数から算出 ──
-                    _p["prediction_affected_count"] = sum(
-                        1 for _nid, _n in topology.items()
-                        if (_n.get('parent_id') if isinstance(_n, dict)
-                            else getattr(_n, 'parent_id', None)) == _dev_id
-                    )
-
-                    # ── 確信度・タイムラインをレベルに応じて動的調整 ──
-                    # base_confidence に level ボーナス（L1:+4% L5:+20%）
-                    _base_conf   = float(_p.get("confidence", 0.5))
-                    _level_boost = min(0.20, _sim_level * 0.04)
-                    _p["confidence"] = round(min(0.99, _base_conf + _level_boost), 2)
-                    _p["prob"]       = _p["confidence"]
-
-                    # time_to_critical_min: レベル↑ほど急性期が短くなる（L1=100% L5=52%）
-                    _base_ttc  = int(_p.get("time_to_critical_min", 60))
-                    _ttc_scale = max(0.4, 1.0 - (_sim_level - 1) * 0.12)
-                    _p["time_to_critical_min"]            = max(10, int(_base_ttc * _ttc_scale))
-                    _p["prediction_time_to_critical_min"] = _p["time_to_critical_min"]
-                    _p["prediction_timeline"]             = f"{_p['time_to_critical_min']}分後"
-
-                    # early_warning_hours: レベル↑ほど早期検知ウィンドウが縮小
-                    _base_ewh = int(_p.get("early_warning_hours", 24))
-                    _p["early_warning_hours"]            = max(1, int(_base_ewh * _ttc_scale))
-                    _p["prediction_early_warning_hours"] = _p["early_warning_hours"]
-
-                    # signal_count（LLMプロンプト用）
+                    # signal_count のみ LLM プロンプト用に追加
                     _p["prediction_signal_count"] = _signal_count
 
                     if not any(d.get("id") == _dev_id for d in dt_predictions):
@@ -633,8 +618,8 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     pred_label      = (pred_item.get('predicted_state')
                                        or pred_item.get('label', '').replace('🔮 [予兆] ', '')
                                        or '不明')
-                    pred_early_hours = pred_item.get('prediction_early_warning_hours',
-                                        pred_item.get('early_warning_hours', 0))
+                    ttf_hours       = pred_item.get('prediction_time_to_failure_hours', 0)
+                    failure_dt      = pred_item.get('prediction_failure_datetime', '')
                     rule_pattern    = pred_item.get('rule_pattern', '')
                     criticality     = pred_item.get('criticality', 'standard')
                     reasons         = pred_item.get('reasons', [])
@@ -663,17 +648,27 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         unsafe_allow_html=True
                     )
 
-                    # ── 予兆詳細カード ─────────────────────────────
+                    # ── RUL予測詳細カード ─────────────────────────────
+                    # 障害発生予測時刻の表示
+                    if ttf_hours >= 24:
+                        ttf_display = f"今後 <b>{ttf_hours // 24}日後</b>"
+                        if failure_dt:
+                            ttf_display += f" ({failure_dt}頃)"
+                    elif ttf_hours > 0:
+                        ttf_display = f"今後 <b>{ttf_hours}時間後</b>"
+                        if failure_dt:
+                            ttf_display += f" ({failure_dt}頃)"
+                    else:
+                        ttf_display = "<span style='color:#d32f2f'>障害が切迫</span>"
+                    
                     st.markdown(
                         f"<div style='background:#FFF3E0;border-radius:6px;"
                         f"padding:10px 12px;margin:6px 0;font-size:13px;'>"
                         f"<b>🔮 予測障害:</b> {pred_label}<br>"
-                        f"<b>⏱️ 急性期まで:</b> "
-                        + (f"<span style='color:#d32f2f;font-weight:bold;'>{ttc_min}分</span>"
+                        f"<b>📅 障害発生予測:</b> {ttf_display}<br>"
+                        f"<b>⏱️ 急性期進行:</b> "
+                        + (f"症状発症後 <span style='color:#d32f2f;font-weight:bold;'>{ttc_min}分</span> でサービス断"
                            if ttc_min > 0 else "<span style='color:#d32f2f'>不明</span>")
-                        + f"<br><b>👁️ 早期検知:</b> "
-                        + (f"今後{pred_early_hours // 24}日後に顕著化" if pred_early_hours >= 24
-                           else (f"今後{pred_early_hours}時間後に顕著化" if pred_early_hours > 0 else "不明"))
                         + (f"<br><b>📡 影響範囲:</b> 配下 <b>{pred_affected}台</b> 通信断リスク"
                            if pred_affected > 0 else "")
                         + f"</div>",
@@ -971,16 +966,27 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             if is_pred_rem:
                 timeline    = selected_incident_candidate.get('prediction_timeline', '不明')
                 affected    = selected_incident_candidate.get('prediction_affected_count', 0)
-                early_hours = selected_incident_candidate.get('prediction_early_warning_hours', 0)
-                early_display = (f"今後 <b>{early_hours // 24}日後</b> に症状が顕著化" if early_hours >= 24
-                                 else (f"今後 <b>{early_hours}時間後</b> に症状が顕著化" if early_hours > 0
-                                       else "不明"))
+                ttf_hours   = selected_incident_candidate.get('prediction_time_to_failure_hours', 0)
+                failure_dt  = selected_incident_candidate.get('prediction_failure_datetime', '')
+                
+                # RUL表示
+                if ttf_hours >= 24:
+                    ttf_display = f"今後 <b>{ttf_hours // 24}日後</b>"
+                    if failure_dt:
+                        ttf_display += f" ({failure_dt}頃)"
+                elif ttf_hours > 0:
+                    ttf_display = f"今後 <b>{ttf_hours}時間後</b>"
+                    if failure_dt:
+                        ttf_display += f" ({failure_dt}頃)"
+                else:
+                    ttf_display = "<b>障害が切迫</b>"
+                
                 st.markdown(f"""
                 <div style="background-color:#fff3e0;padding:10px;border-radius:5px;border:1px solid #ff9800;color:#e65100;margin-bottom:10px;">
                     <strong>🔮 Digital Twin 未来予測 (Predictive Maintenance)</strong><br>
                     <b>{selected_incident_candidate['id']}</b> で障害の兆候を検出しました。<br>
-                    ・早期予兆: {early_display}<br>
-                    ・急性期進行: 発症後 <b>{timeline}</b> に深刻化の恐れ<br>
+                    ・障害発生予測: {ttf_display}<br>
+                    ・急性期進行: 症状発症後 <b>{timeline}</b> でサービス断の恐れ<br>
                     ・影響範囲: <b>{affected}台</b> のデバイスに影響の可能性<br>
                     ・推奨: メンテナンスウィンドウでの予防交換/対応<br>
                     (信頼度: <span style="font-size:1.2em;font-weight:bold;">{selected_incident_candidate['prob']*100:.0f}%</span>)
