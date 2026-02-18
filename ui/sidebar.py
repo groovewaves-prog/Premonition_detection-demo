@@ -48,6 +48,12 @@ def render_sidebar():
                     if injected and selected != "正常稼働":
                         # 障害シナリオ選択時は予兆シミュレーションをクリア
                         st.session_state["injected_weak_signal"] = None
+                        
+                        # ★ 関連するセッションステートキーも完全クリア
+                        dt_prev_key = f"dt_prev_sim_device_{site_id}"
+                        if dt_prev_key in st.session_state:
+                            del st.session_state[dt_prev_key]
+                        
                         st.info(
                             f"🔄 障害シナリオ「{selected}」を選択したため、"
                             "予兆シミュレーションを自動的にクリアしました。"
@@ -63,6 +69,9 @@ def render_sidebar():
                         st.session_state.messages = []
                         st.session_state.chat_session = None
                         st.session_state.live_result = None
+                    
+                    # ★ 重要：セッションステート変更後は必ず rerun
+                    st.rerun()
         
         st.divider()
         
