@@ -49,7 +49,7 @@ class StorageManager:
         if not os.path.exists(self.paths["event_log_dir"]):
             os.makedirs(self.paths["event_log_dir"], mode=0o700, exist_ok=True)
 
-        self._db_lock = threading.Lock()
+        self._db_lock = threading.RLock()  # ★ RLock: 再入可能ロック（同スレッドのネスト取得を許容）
         self._conn = None
         self._init_sqlite()
 
