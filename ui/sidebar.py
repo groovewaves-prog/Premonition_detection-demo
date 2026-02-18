@@ -42,6 +42,17 @@ def render_sidebar():
                 
                 if selected != current:
                     st.session_state.site_scenarios[site_id] = selected
+                    
+                    # ★ 予兆シミュレーションとの競合を防ぐため自動クリア
+                    injected = st.session_state.get("injected_weak_signal")
+                    if injected and selected != "正常稼働":
+                        # 障害シナリオ選択時は予兆シミュレーションをクリア
+                        st.session_state["injected_weak_signal"] = None
+                        st.info(
+                            f"🔄 障害シナリオ「{selected}」を選択したため、"
+                            "予兆シミュレーションを自動的にクリアしました。"
+                        )
+                    
                     # キャッシュクリア
                     keys_to_remove = [k for k in list(st.session_state.report_cache.keys()) if site_id in k]
                     for k in keys_to_remove:
@@ -224,6 +235,23 @@ def _render_weak_signal_injection():
         
         # Session State に保存
         if log_messages:
+            # ★ 障害シナリオとの競合チェック
+            active_site = st.session_state.get("active_site")
+            if active_site:
+                current_scenario = st.session_state.site_scenarios.get(active_site, "正常稼働")
+                if current_scenario != "正常稼働":
+                    st.error(
+                        f"⛔ **競合エラー**\n\n"
+                        f"現在、拠点 `{active_site}` では障害シナリオ「**{current_scenario}**」が実行中です。\n"
+                        "予兆シミュレーションは **正常稼働時** にのみ有効です。\n\n"
+                        "💡 対処方法:\n"
+                        "1. 拠点シナリオ設定を「**正常稼働**」に戻す\n"
+                        "2. 予兆シミュレーションを実行\n"
+                        "3. （オプション）その後、障害シナリオに切り替えて予兆の的中を確認"
+                    )
+                    st.session_state["injected_weak_signal"] = None
+                    return  # 早期終了
+            
             st.session_state["injected_weak_signal"] = {
                 "device_id": target_device,
                 "messages": log_messages,
