@@ -5,13 +5,18 @@ import re
 from enum import Enum
 from typing import List, Dict, Any, Optional
 
-import google.generativeai as genai  # 旧SDK互換（後方互換のため残す）
+# 新SDK優先、旧SDKにフォールバック
 try:
     from google import genai as _new_genai
     _USE_NEW_SDK = True
+    genai = _new_genai  # 統一参照
 except ImportError:
     _new_genai = None
     _USE_NEW_SDK = False
+    try:
+        import google.generativeai as genai  # 旧SDK互換フォールバック
+    except ImportError:
+        genai = None  # どちらも未インストールの場合
 
 # --- Digital Twin Integration (V45 Package) ---
 try:
