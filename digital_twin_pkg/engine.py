@@ -718,6 +718,50 @@ class DigitalTwinEngine:
             logger.warning(f"forecast_auto_resolve: {e}")
         return resolved
 
+    def forecast_auto_confirm_on_incident(self, device_id: str, scenario: str = "",
+                                          note: str = "") -> int:
+        """
+        障害発生時に該当デバイスの open 予兆を自動的に confirmed_incident に更新
+        
+        運用実態に即した設計:
+        - 運用者が「障害確認済み」を手動登録するのは非現実的
+        - 障害シナリオ発生時に自動判定する方が正確
+        
+        Args:
+            device_id: 障害が発生したデバイスID
+            scenario: 発生した障害シナリオ名（ログ用）
+            note: 追加メモ
+        
+        Returns:
+            confirmed に更新した予兆の件数
+        """
+        if not self.storage._conn:
+            return 0
+        confirmed = 0
+        auto_note = f"Auto-confirmed on incident: {scenario}" if scenario else "Auto-confirmed on incident"
+        if note:
+            auto_note += f" | {note}"
+        
+        try:
+            with self.storage._db_lock:
+                cur = self.storage._conn.cursor()
+                cur.execute("""
+                    SELECT forecast_id FROM forecast_ledger
+                    WHERE device_id=? AND status='open'
+                    ORDER BY created_at DESC""", (device_id,))
+                rows = cur.fetchall() or []
+            
+            for (fid,) in rows:
+                r = self.forecast_register_outcome(
+                    fid, "confirmed_incident", note=auto_note, auto=True)
+                if r.get("ok"):
+                    confirmed += 1
+                    logger.info(f"Auto-confirmed forecast {fid[:12]} on incident: {scenario}")
+        except Exception as e:
+            logger.warning(f"forecast_auto_confirm_on_incident: {e}")
+        
+        return confirmed
+
     def forecast_list_open(self, device_id: Optional[str] = None,
                            limit: int = 50) -> List[Dict[str, Any]]:
         """open 中の予兆リストを返す（UI表示用）"""
