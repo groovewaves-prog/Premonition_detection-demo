@@ -1,4 +1,4 @@
-# digital_twin_pkg/engine.py (Knowledge Transfer Update)
+# digital_twin_pkg/engine.py  ―  DigitalTwinEngine コアロジック（Phase1 Predict API + RUL予測）
 import logging
 import time
 import json
@@ -60,6 +60,8 @@ class PredictResult:
     criticality:          str  = "standard"
     time_to_critical_min: int  = 60
     early_warning_hours:  int  = 24
+    time_to_failure_hours: int = 336  # ★ RUL: 今から完全故障まで（時間）
+    predicted_failure_datetime: str = ""  # ★ 故障発生予測日時（ISO形式）
 
     def to_dict(self, affected_count: int = 0, source: str = "real"):
         return {
@@ -73,6 +75,8 @@ class PredictResult:
             "criticality":          self.criticality or "standard",
             "time_to_critical_min": int(self.time_to_critical_min),
             "early_warning_hours":  int(self.early_warning_hours),
+            "time_to_failure_hours": int(self.time_to_failure_hours),
+            "predicted_failure_datetime": self.predicted_failure_datetime,
             # ── cockpit.py 互換フィールド ──────────────────────
             "is_prediction":        True,
             "source":               source,
@@ -84,6 +88,8 @@ class PredictResult:
             "prediction_time_to_critical_min": int(self.time_to_critical_min),
             "prediction_early_warning_hours":  int(self.early_warning_hours),
             "prediction_affected_count":       int(affected_count),
+            "prediction_time_to_failure_hours": int(self.time_to_failure_hours),
+            "prediction_failure_datetime":      self.predicted_failure_datetime,
         }
 
 
@@ -384,6 +390,12 @@ class DigitalTwinEngine:
         _conf_boost    = (_level - 1) * 0.05          # +0.00〜+0.20
         _ttc_factor    = 1.0 - (_level - 1) * 0.12   # ×1.0〜×0.52（短縮）
         _early_factor  = 1.0 + (_level - 1) * 0.20   # ×1.0〜×1.80（延長）
+        
+        # ★ RUL (Remaining Useful Life) 予測 ──────────────────
+        # Temporal GNN論文: time_to_failure = f(degradation_level)
+        # Level↑ → 故障が近い → RUL↓
+        _ttf_scale = (6 - _level) / 5  # L1=1.0(初期), L5=0.2(末期)
+        # L1=100%, L2=80%, L3=60%, L4=40%, L5=20%
 
         # 影響範囲: children_map から再帰的に配下デバイス数を算出
         def _count_children(dev_id: str, visited=None) -> int:
@@ -409,6 +421,17 @@ class DigitalTwinEngine:
                 _base_early = int(getattr(rule, "early_warning_hours", 24) or 24)
                 _ttc   = max(5,  int(_base_ttc   * _ttc_factor))
                 _early = max(1,  int(_base_early * _early_factor))
+                
+                # ★ RUL計算: early_warning_hours をベースに故障までの時間を算出
+                _base_ttf_hours = int(getattr(rule, "early_warning_hours", 336) or 336)
+                _ttf_hours = max(1, int(_base_ttf_hours * _ttf_scale))
+                # L1=336h(14日), L2=269h(11日), L3=202h(8日), L4=134h(6日), L5=67h(3日)
+                
+                # 故障予測日時を算出
+                from datetime import datetime, timedelta
+                _failure_dt = datetime.now() + timedelta(hours=_ttf_hours)
+                _failure_dt_str = _failure_dt.strftime("%Y-%m-%d %H:%M")
+                
                 pr = PredictResult(
                     predicted_state      = str(getattr(rule, "escalated_state", "unknown")),
                     confidence           = conf,
@@ -420,6 +443,8 @@ class DigitalTwinEngine:
                     criticality          = str(getattr(rule, "criticality", "standard") or "standard"),
                     time_to_critical_min = _ttc,
                     early_warning_hours  = _early,
+                    time_to_failure_hours = _ttf_hours,
+                    predicted_failure_datetime = _failure_dt_str,
                 )
                 results.append(pr)
             except Exception:
