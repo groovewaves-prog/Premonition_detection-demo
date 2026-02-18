@@ -18,8 +18,21 @@ import concurrent.futures
 from typing import Dict, List, Optional, Generator, Any
 from enum import Enum
 
-import google.generativeai as genai
-from netmiko import ConnectHandler
+try:
+    from google import genai as _new_genai
+    _USE_NEW_SDK = True
+    # 旧SDK互換のため型ヒント用に残す
+    import google.generativeai as genai
+except ImportError:
+    _USE_NEW_SDK = False
+    import google.generativeai as genai
+    _new_genai = None
+try:
+    from netmiko import ConnectHandler
+    NETMIKO_AVAILABLE = True
+except ImportError:
+    ConnectHandler = None
+    NETMIKO_AVAILABLE = False
 
 from rate_limiter import GlobalRateLimiter, RateLimitConfig
 
@@ -74,10 +87,11 @@ class RemediationResult:
 
 
 # =====================================================
-# グローバル状態
+# グローバル状態（新SDK対応）
 # =====================================================
 _rate_limiter: Optional[GlobalRateLimiter] = None
-_model: Optional[genai.GenerativeModel] = None
+_genai_client = None   # 新SDK: genai.Client インスタンス
+_model: Optional[Any] = None  # 旧SDK互換用（フォールバック）
 _api_configured = False
 
 
@@ -88,20 +102,47 @@ def _get_limiter() -> GlobalRateLimiter:
     return _rate_limiter
 
 
-def _get_model(api_key: str) -> Optional[genai.GenerativeModel]:
-    global _model, _api_configured
-    if _api_configured and _model:
-        return _model
+def _get_client(api_key: str):
+    """新SDK の Client を取得（シングルトン）"""
+    global _genai_client, _model, _api_configured
+    if _api_configured and _genai_client:
+        return _genai_client
     if not api_key:
         return None
     try:
-        genai.configure(api_key=api_key)
-        _model = genai.GenerativeModel(MODEL_NAME)
-        _api_configured = True
-        return _model
+        if _USE_NEW_SDK and _new_genai:
+            _genai_client = _new_genai.Client(api_key=api_key)
+            _api_configured = True
+            return _genai_client
+        else:
+            # 旧SDK フォールバック
+            genai.configure(api_key=api_key)
+            _model = genai.GenerativeModel(MODEL_NAME)
+            _api_configured = True
+            return None  # 旧SDKはclientではなくmodelを使う
     except Exception as e:
         logger.error(f"API config error: {e}")
         return None
+
+
+def _get_model(api_key: str):
+    """旧SDK互換: モデルオブジェクトを取得"""
+    global _model, _api_configured
+    if _api_configured and _model:
+        return _model
+    _get_client(api_key)  # 初期化を試みる
+    return _model
+
+
+def _get_model_or_client(api_key: str):
+    """
+    新SDK → genai.Client、旧SDK → GenerativeModel を返す統一関数。
+    _stream_generate / generate_content 系の呼び出し元はこちらを使う。
+    """
+    if _USE_NEW_SDK and _new_genai:
+        return _get_client(api_key)
+    else:
+        return _get_model(api_key)
 
 
 # =====================================================
@@ -153,39 +194,45 @@ def _is_retryable_error(e: Exception) -> bool:
 # ★ストリーミングLLM呼び出し（遅延解消・検証削除）
 # =====================================================
 def _stream_generate(
-    model: genai.GenerativeModel,
+    model_or_client,
     prompt: str,
     max_retries: int = 2
 ) -> Generator[str, None, None]:
     """
-    ストリーミング生成（根本修正版）
-    
-    ★改善ポイント:
-    - validate_response 完全削除
-    - レスポンス取得後は即座にイテレート開始
-    - チャンクは即座にyield
+    ストリーミング生成（新SDK/旧SDK両対応版）
+
+    Args:
+        model_or_client: 新SDK→ genai.Client、旧SDK→ GenerativeModel
+        prompt: プロンプト文字列
+        max_retries: 最大リトライ回数
     """
     limiter = _get_limiter()
-    
+
     for attempt in range(max_retries + 1):
         try:
-            # レート制限チェック（即時判定）
             if not limiter.wait_for_slot(timeout=30):
                 if attempt < max_retries:
                     yield "⏳ レート制限中...\n"
                     continue
                 yield "❌ レート制限タイムアウト"
                 return
-            
+
             limiter.record_request()
-            
-            # ★ストリーミング開始 - 即座にイテレート
-            # temperature=0.1で出力のブレを抑制
-            response = model.generate_content(
-                prompt, 
-                stream=True,
-                generation_config={"temperature": 0.1}
-            )
+
+            # 新SDK(client)と旧SDK(model)で分岐
+            if _USE_NEW_SDK and _new_genai and hasattr(model_or_client, 'models'):
+                # 新SDK: client.models.generate_content_stream
+                response = model_or_client.models.generate_content_stream(
+                    model=MODEL_NAME,
+                    contents=prompt
+                )
+            else:
+                # 旧SDK互換
+                response = model_or_client.generate_content(
+                    prompt,
+                    stream=True,
+                    generation_config={"temperature": 0.1}
+                )
             
             # ★検証なし - 直接イテレート
             has_content = False
@@ -221,7 +268,7 @@ def _stream_generate(
 # =====================================================
 def generate_fake_log_by_ai(scenario_name: str, target_node, api_key: str) -> str:
     """シナリオに基づく障害ログ生成"""
-    model = _get_model(api_key)
+    model = _get_model_or_client(api_key)
     if not model:
         return "Error: API not configured"
 
@@ -239,9 +286,12 @@ def generate_fake_log_by_ai(scenario_name: str, target_node, api_key: str) -> st
         if not limiter.wait_for_slot(timeout=30):
             return "Error: Rate limit"
         limiter.record_request()
-        
-        response = model.generate_content(prompt)
-        result = response.text if response else "Error: No response"
+
+        if _USE_NEW_SDK and _new_genai and hasattr(model, 'models'):
+            resp = model.models.generate_content(model=MODEL_NAME, contents=prompt)
+        else:
+            resp = model.generate_content(prompt)
+        result = resp.text if resp else "Error: No response"
         limiter.set_cache(cache_key, result)
         return result
     except Exception as e:
@@ -253,7 +303,7 @@ def generate_fake_log_by_ai(scenario_name: str, target_node, api_key: str) -> st
 # =====================================================
 def predict_initial_symptoms(scenario_name: str, api_key: str) -> Dict:
     """障害シナリオから初期症状を予測"""
-    model = _get_model(api_key)
+    model = _get_model_or_client(api_key)
     if not model:
         return {}
 
@@ -292,7 +342,7 @@ def generate_analyst_report(
     api_key: str
 ) -> str:
     """原因分析レポート（非ストリーミング版）"""
-    model = _get_model(api_key)
+    model = _get_model_or_client(api_key)
     if not model:
         return "Error: API not configured"
 
@@ -358,7 +408,7 @@ def generate_analyst_report_streaming(
     - キャッシュヒット時は即座に全文返却
     - ストリーミング開始後は即座にyield
     """
-    model = _get_model(api_key)
+    model = _get_model_or_client(api_key)
     if not model:
         yield "Error: API not configured"
         return
@@ -418,7 +468,7 @@ def generate_remediation_commands(
     api_key: str
 ) -> str:
     """復旧手順（非ストリーミング版）"""
-    model = _get_model(api_key)
+    model = _get_model_or_client(api_key)
     if not model:
         return "Error: API not configured"
 
@@ -484,7 +534,7 @@ def generate_remediation_commands_streaming(
     - キャッシュヒット時は即座に全文返却
     - ストリーミング開始後は即座にyield
     """
-    model = _get_model(api_key)
+    model = _get_model_or_client(api_key)
     if not model:
         yield "Error: API not configured"
         return
@@ -547,6 +597,8 @@ def run_diagnostic_simulation(
         return {"status": "SKIPPED", "sanitized_log": "No action required.", "error": None}
 
     if "[Live]" in scenario_type:
+        if not NETMIKO_AVAILABLE:
+            return {"status": "ERROR", "sanitized_log": "", "error": "netmiko is not installed. Live connection unavailable."}
         commands = ["terminal length 0", "show version", "show interface brief"]
         try:
             with ConnectHandler(**SANDBOX_DEVICE) as ssh:
