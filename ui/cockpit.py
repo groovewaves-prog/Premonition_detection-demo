@@ -306,6 +306,17 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
     # アラーム生成
     alarms = generate_alarms_for_scenario(topology, scenario)
     status = get_status_from_alarms(scenario, alarms)
+    
+    # ★ 将来の拡張: 障害発生時に予兆を自動確認（コメントアウト）
+    # if dt_engine and scenario != "正常稼働":
+    #     # CRITICAL アラームが発生したデバイスの予兆を自動的に confirmed_incident に更新
+    #     critical_devices = {a.device_id for a in alarms if a.severity == "CRITICAL"}
+    #     for dev_id in critical_devices:
+    #         confirmed_count = dt_engine.forecast_auto_confirm_on_incident(
+    #             dev_id, scenario=scenario, note="障害シナリオ発生により自動確認"
+    #         )
+    #         if confirmed_count > 0:
+    #             logger.info(f"Auto-confirmed {confirmed_count} predictions for {dev_id} on scenario: {scenario}")
 
     # 予兆シグナル注入
     injected = st.session_state.get("injected_weak_signal")
@@ -1123,36 +1134,77 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     st.markdown("#### 🔎 Post-Fix Verification Logs")
                     st.code(st.session_state.verification_log, language="text")
 
-            # ★ Phase1: 予兆 Outcome 手動登録ボタン（例外修正用）
+            # ★ Phase1: 予兆ステータス履歴（運用実態に即した設計）
             if dt_engine and selected_incident_candidate:
                 _oc_device = selected_incident_candidate.get("id", "")
                 _open_preds = dt_engine.forecast_list_open(device_id=_oc_device)
                 if _open_preds:
                     st.markdown("---")
-                    st.markdown("##### 🔮 予兆ステータス登録（手動修正）")
-                    st.caption(f"対象機器 `{_oc_device}` の未解決予兆: {len(_open_preds)}件")
-                    _oc1, _oc2, _oc3 = st.columns(3)
-                    _btn_confirm = _oc1.button("✅ 障害確認済み", key="oc_confirm",
-                                               help="予兆が実際に障害に発展した場合")
-                    _btn_mitig   = _oc2.button("🛡️ 抑え込んだ",  key="oc_mitig",
-                                               help="予防対応により障害を回避した場合")
-                    _btn_false   = _oc3.button("❌ 誤検知",       key="oc_false",
-                                               help="予兆が外れた場合")
-                    for _fp in _open_preds:
+                    st.markdown("##### 📜 予兆ステータス履歴")
+                    st.caption(
+                        f"対象機器 `{_oc_device}` の未対応予兆: **{len(_open_preds)}件**  \n"
+                        f"💡 運用者の判断で対応ステータスを登録してください。ボタンを押すと履歴から削除され、学習データに反映されます。"
+                    )
+                    
+                    for idx, _fp in enumerate(_open_preds, 1):
                         _fid = _fp.get("forecast_id", "")
-                        if _btn_confirm:
-                            r = dt_engine.forecast_register_outcome(_fid, "confirmed_incident")
-                            if r.get("ok"):
-                                st.success(f"確認済みとして登録: {_fid[:12]} "
-                                           f"({'成功' if r.get('success') else '期限超過'})")
-                        elif _btn_mitig:
-                            r = dt_engine.forecast_register_outcome(_fid, "mitigated")
-                            if r.get("ok"):
-                                st.success(f"抑え込みとして登録: {_fid[:12]}")
-                        elif _btn_false:
-                            r = dt_engine.forecast_register_outcome(_fid, "false_alarm")
-                            if r.get("ok"):
-                                st.info(f"誤検知として登録: {_fid[:12]}")
+                        _rule = _fp.get("rule_pattern", "不明")
+                        _conf = float(_fp.get("confidence", 0.0))
+                        _created = _fp.get("created_at", "")
+                        _ttf_hours = _fp.get("time_to_failure_hours", 0)
+                        _failure_dt = _fp.get("predicted_failure_datetime", "")
+                        
+                        # 予兆情報の表示
+                        with st.container():
+                            st.markdown(
+                                f"<div style='background:#FFF3E0;border-left:4px solid #FF9800;"
+                                f"padding:8px 12px;margin:8px 0;border-radius:4px;'>"
+                                f"<b>📍 予兆 #{idx}</b> - {_rule}<br>"
+                                f"<small>検出時刻: {_created} | 信頼度: {_conf*100:.0f}%</small><br>",
+                                unsafe_allow_html=True
+                            )
+                            if _ttf_hours > 0:
+                                if _ttf_hours >= 24:
+                                    ttf_display = f"今後 {_ttf_hours // 24}日後に障害発生予測"
+                                    if _failure_dt:
+                                        ttf_display += f" ({_failure_dt}頃)"
+                                else:
+                                    ttf_display = f"今後 {_ttf_hours}時間後に障害発生予測"
+                                st.markdown(f"<small>⏰ {ttf_display}</small>", unsafe_allow_html=True)
+                            st.markdown("</div>", unsafe_allow_html=True)
+                            
+                            # ステータス登録ボタン（2つに整理）
+                            _btn_col1, _btn_col2, _spacer = st.columns([1, 1, 2])
+                            with _btn_col1:
+                                if st.button(
+                                    "✅ 対応済み",
+                                    key=f"btn_handled_{_fid[:8]}",
+                                    help="予防対応を実施した、または障害を抑え込んだ場合",
+                                    use_container_width=True
+                                ):
+                                    r = dt_engine.forecast_register_outcome(
+                                        _fid, "mitigated",
+                                        note=f"運用者が対応済みとして登録 (device={_oc_device})"
+                                    )
+                                    if r.get("ok"):
+                                        st.success(f"✅ 対応済みとして登録しました (ID: {_fid[:12]})")
+                                        st.rerun()
+                            
+                            with _btn_col2:
+                                if st.button(
+                                    "❌ 誤検知",
+                                    key=f"btn_false_{_fid[:8]}",
+                                    help="予兆が外れた、または過剰検知だった場合",
+                                    use_container_width=True
+                                ):
+                                    r = dt_engine.forecast_register_outcome(
+                                        _fid, "false_alarm",
+                                        note=f"運用者が誤検知として登録 (device={_oc_device})"
+                                    )
+                                    if r.get("ok"):
+                                        st.info(f"❌ 誤検知として登録しました (ID: {_fid[:12]})")
+                                        st.rerun()
+
 
         else:
             # prob <= 0.6 or no candidate
