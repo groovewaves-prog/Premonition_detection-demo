@@ -1146,6 +1146,37 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         f"💡 類似予兆はグループ化されています。一括操作も可能です。"
                     )
                     
+                    # ★ コンポーネント名抽出関数
+                    import re
+                    def _extract_component(message: str) -> str:
+                        """ログメッセージからコンポーネント名を抽出"""
+                        if not message:
+                            return ""
+                        
+                        # インターフェース名（Gi, Te, ge など）
+                        interface_patterns = [
+                            (r'(Gi\d+/\d+/\d+)', lambda m: m.group(1)),
+                            (r'(Te\d+/\d+/\d+)', lambda m: m.group(1)),
+                            (r'(ge-\d+/\d+/\d+)', lambda m: m.group(1)),
+                            (r'(Ethernet\d+/\d+/\d+)', lambda m: m.group(1)),
+                        ]
+                        for pattern, formatter in interface_patterns:
+                            match = re.search(pattern, message)
+                            if match:
+                                return formatter(match)
+                        
+                        # BGP peer (IP address)
+                        ip_match = re.search(r'(?:peer|neighbor)\s+(\d+\.\d+\.\d+\.\d+)', message, re.IGNORECASE)
+                        if ip_match:
+                            return f"Peer {ip_match.group(1)}"
+                        
+                        # AS番号
+                        as_match = re.search(r'\(AS(\d+)\)', message)
+                        if as_match:
+                            return f"AS{as_match.group(1)}"
+                        
+                        return ""
+                    
                     # ★ 予兆をルールパターンごとにグループ化
                     from collections import defaultdict
                     from datetime import datetime
@@ -1253,6 +1284,14 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                 _created_raw = _fp.get("created_at", 0)
                                 _ttf_hours = _fp.get("time_to_failure_hours", 0)
                                 _failure_dt = _fp.get("predicted_failure_datetime", "")
+                                _source_msg = _fp.get("source", "")
+                                
+                                # ★ コンポーネント名を抽出（#1の代わりに表示）
+                                _component = _extract_component(_source_msg)
+                                if _component:
+                                    _display_id = _component
+                                else:
+                                    _display_id = f"#{idx}"
                                 
                                 # 検出時刻を人間可読化
                                 try:
@@ -1265,7 +1304,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                     st.markdown(
                                         f"<div style='background:#FAFAFA;border-left:2px solid #CCC;"
                                         f"padding:6px 10px;margin:4px 0;border-radius:3px;'>"
-                                        f"<small><b>#{idx}</b> | 検出: {_created_readable} | 信頼度: {_conf*100:.0f}%</small>",
+                                        f"<small><b>{_display_id}</b> | 検出: {_created_readable} | 信頼度: {_conf*100:.0f}%</small>",
                                         unsafe_allow_html=True
                                     )
                                     if _ttf_hours > 0:
