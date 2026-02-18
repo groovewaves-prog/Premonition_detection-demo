@@ -697,15 +697,46 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     # ── 推奨アクション ─────────────────────────────
                     if rec_actions:
                         with st.expander("🛠️ 推奨アクション", expanded=True):
-                            for _act in rec_actions:
-                                _title  = _act.get('title', '')
+                            for idx, _act in enumerate(rec_actions, 1):
+                                _title = _act.get('title', '')
                                 _effect = _act.get('effect', '')
+                                _priority = _act.get('priority', 'medium')
+                                _rationale = _act.get('rationale', '')
+                                _steps = _act.get('steps', '')
+                                
+                                # 優先度に応じた色とアイコン
+                                if _priority == 'high':
+                                    _bg_color = '#FFEBEE'  # 薄い赤
+                                    _border_color = '#D32F2F'  # 濃い赤
+                                    _icon = '🔴'
+                                    _priority_label = '最優先'
+                                elif _priority == 'medium':
+                                    _bg_color = '#FFF3E0'  # 薄いオレンジ
+                                    _border_color = '#FF6F00'  # 濃いオレンジ
+                                    _icon = '🟠'
+                                    _priority_label = '推奨'
+                                else:  # low
+                                    _bg_color = '#E8F5E9'  # 薄い緑
+                                    _border_color = '#2E7D32'  # 濃い緑
+                                    _icon = '🟢'
+                                    _priority_label = '補助'
+                                
                                 st.markdown(
-                                    f"<div style='background:#E8F5E9;padding:6px 10px;"
-                                    f"border-radius:4px;margin:4px 0;font-size:12px;'>"
-                                    f"✅ <b>{_title}</b>"
-                                    + (f"<br><span style='color:#2e7d32;'>{_effect}</span>"
-                                       if _effect else "")
+                                    f"<div style='background:{_bg_color};padding:10px 12px;"
+                                    f"border-left:4px solid {_border_color};border-radius:4px;"
+                                    f"margin:8px 0;font-size:13px;'>"
+                                    f"<div style='margin-bottom:4px;'>"
+                                    f"<b>{_icon} {idx}. {_title}</b>"
+                                    f"<span style='float:right;background:{_border_color};color:white;"
+                                    f"padding:2px 8px;border-radius:3px;font-size:11px;'>{_priority_label}</span>"
+                                    f"</div>"
+                                    + (f"<div style='color:#424242;margin:4px 0;font-size:12px;'>"
+                                       f"💡 効果: {_effect}</div>" if _effect else "")
+                                    + (f"<div style='color:#616161;margin:4px 0;font-size:11px;'>"
+                                       f"📌 根拠: {_rationale}</div>" if _rationale else "")
+                                    + (f"<div style='background:white;padding:6px;border-radius:3px;"
+                                       f"margin-top:6px;font-size:11px;color:#424242;white-space:pre-wrap;'>"
+                                       f"<b>📋 手順:</b><br>{_steps}</div>" if _steps else "")
                                     + "</div>",
                                     unsafe_allow_html=True
                                 )
