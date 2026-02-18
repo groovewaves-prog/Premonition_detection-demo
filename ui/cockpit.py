@@ -7,10 +7,15 @@ import hashlib
 from typing import Optional, List, Dict, Any
 
 try:
-    import google.generativeai as genai
+    from google import genai
     GENAI_AVAILABLE = True
 except ImportError:
-    GENAI_AVAILABLE = False
+    try:
+        import google.generativeai as genai  # 旧SDK互換フォールバック
+        GENAI_AVAILABLE = True
+    except ImportError:
+        genai = None
+        GENAI_AVAILABLE = False
 
 from registry import get_paths, load_topology, get_display_name
 from alarm_generator import generate_alarms_for_scenario, Alarm, get_alarm_summary
@@ -1436,9 +1441,15 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 st.code(st.session_state.chat_quick_text)
 
             if st.session_state.chat_session is None and api_key and GENAI_AVAILABLE:
-                genai.configure(api_key=api_key)
-                model_obj = genai.GenerativeModel("gemma-3-12b-it")
-                st.session_state.chat_session = model_obj.start_chat(history=[])
+                try:
+                    # 新SDK: Client.chats.create()
+                    _client = genai.Client(api_key=api_key)
+                    st.session_state.chat_session = _client.chats.create(model="gemma-3-12b-it")
+                except AttributeError:
+                    # 旧SDK互換フォールバック
+                    genai.configure(api_key=api_key)
+                    model_obj = genai.GenerativeModel("gemma-3-12b-it")
+                    st.session_state.chat_session = model_obj.start_chat(history=[])
 
             tab1, tab2 = st.tabs(["💬 会話", "📝 履歴"])
 
