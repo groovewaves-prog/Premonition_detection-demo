@@ -180,21 +180,22 @@ def _render_weak_signal_injection():
         if degradation_level > 0:
             if "Optical" in scenario_type:
                 dbm = -23.0 - (degradation_level * 0.4)
+                # ★ コンポーネント情報を明示的に追加
                 # Level1: optical/rx power/dbm ヒット
-                _l1 = (f"%TRANSCEIVER-4-THRESHOLD_VIOLATION: Rx Power {dbm:.1f} dBm "
+                _l1 = (f"%TRANSCEIVER-4-THRESHOLD_VIOLATION: Rx Power {dbm:.1f} dBm on Gi0/0/1 "
                        f"(optical signal degrading). transceiver rx power below threshold.")
                 # Level2: optical signal / light level ヒット
-                _l2 = (f"%OPTICAL-3-SIGNAL_WARN: optical signal level degrading. "
+                _l2 = (f"%OPTICAL-3-SIGNAL_WARN: optical signal level degrading on Te1/0/1. "
                        f"light level {dbm+1.5:.1f} dBm. transceiver rx power loss detected.")
                 # Level3: output drops / queue drops ヒット (複合劣化)
                 crc = degradation_level * 150
                 _l3 = (f"%LINK-3-ERROR: output drops increasing on Gi0/0/0 "
                        f"(Count: {crc}/min). queue drops detected. signal integrity degraded.")
                 # Level4: buffer overflow ヒット
-                _l4 = (f"%HARDWARE-4-BUFFER: buffer overflow risk on optical interface. "
+                _l4 = (f"%HARDWARE-4-BUFFER: buffer overflow risk on optical interface Gi0/0/2. "
                        f"asic_error queue drops {degradation_level*80}. rx power unstable.")
                 # Level5: retransmission / route updates ヒット (L1への波及)
-                _l5 = (f"%OSPF-4-ADJCHANGE: retransmission increase detected. "
+                _l5 = (f"%OSPF-4-ADJCHANGE: retransmission increase detected on Gi0/0/0. "
                        f"route updates {degradation_level*200}/min. "
                        f"optical signal instability causing neighbor keepalive delay.")
                 _pool = [_l1, _l2, _l3, _l4, _l5]
@@ -202,43 +203,45 @@ def _render_weak_signal_injection():
 
             elif "Microburst" in scenario_type:
                 drops = degradation_level * 200
+                # ★ コンポーネント情報を明示的に追加
                 # Level1: queue drops / asic_error ヒット
-                _l1 = (f"%HARDWARE-3-ASIC_ERROR: asic_error queue drops detected "
+                _l1 = (f"%HARDWARE-3-ASIC_ERROR: asic_error queue drops detected on Gi0/1/0 "
                        f"(Count: {drops}). output drops on burst traffic.")
                 # Level2: buffer overflow ヒット
-                _l2 = (f"%QOS-4-BUFFER: buffer overflow risk on ge-0/0/1. "
+                _l2 = (f"%QOS-4-BUFFER: buffer overflow risk on Gi0/1/1. "
                        f"queue drops {drops+100}/sec. output drops increasing.")
                 # Level3: qos-4-policer ヒット
-                _l3 = (f"%QOS-4-POLICER: qos-4-policer traffic exceeding CIR. "
+                _l3 = (f"%QOS-4-POLICER: qos-4-policer traffic exceeding CIR on Gi0/1/2. "
                        f"output drops {degradation_level*80}/min. buffer overflow imminent.")
                 # Level4: output drops + asic_error 複合
-                _l4 = (f"%HARDWARE-4-ASIC: asic_error escalation. output drops {drops*2}/min. "
+                _l4 = (f"%HARDWARE-4-ASIC: asic_error escalation on Gi0/1/0. output drops {drops*2}/min. "
                        f"queue drops buffer overflow threshold reached.")
                 # Level5: 全症状集約
                 retrans = degradation_level * 50
-                _l5 = (f"%TCP-5-RETRANSMIT: retransmission {retrans}/sec. "
+                _l5 = (f"%TCP-5-RETRANSMIT: retransmission {retrans}/sec on Gi0/1/3. "
                        f"queue drops buffer overflow. asic_error output drops critical level.")
                 _pool = [_l1, _l2, _l3, _l4, _l5]
                 log_messages = _pool[:degradation_level]
 
             elif "Route" in scenario_type:
                 updates = degradation_level * 500
+                # ★ BGP ピア情報を明示的に追加
                 # Level1: route updates / bgp neighbor ヒット
-                _l1 = (f"BGP-5-NEIGHBOR: bgp neighbor route updates {updates}/min. "
+                _l1 = (f"BGP-5-NEIGHBOR: bgp neighbor 10.1.1.1 (AS65001) route updates {updates}/min. "
                        f"route instability warning detected.")
                 # Level2: route instability / retransmission ヒット
-                _l2 = (f"%BGP-4-INSTABILITY: route instability detected. "
+                _l2 = (f"%BGP-4-INSTABILITY: route instability detected on peer 10.1.1.2 (AS65002). "
                        f"retransmission rate increasing. neighbor down risk.")
                 # Level3: neighbor down ヒット
-                _l3 = (f"%BGP-4-ADJCHANGE: bgp neighbor down event. "
+                _l3 = (f"%BGP-4-ADJCHANGE: bgp neighbor 10.1.1.1 down event. "
                        f"route updates {updates+500}/min. route instability escalating.")
                 # Level4: 複合シグナル
                 _l4 = (f"%ROUTING-3-CONVERGENCE: route instability causing convergence delay. "
-                       f"retransmission {degradation_level*30}/sec. neighbor down on 2 peers.")
+                       f"retransmission {degradation_level*30}/sec. neighbor down on peers [10.1.1.1, 10.1.1.3].")
                 # Level5: 全症状集約
-                _l5 = (f"%BGP-5-WITHDRAW: route updates withdrawal detected. "
+                _l5 = (f"%BGP-5-WITHDRAW: route updates withdrawal detected on peer 10.1.1.1. "
                        f"route instability critical. retransmission burst. "
-                       f"neighbor down multiple peers. bgp neighbor flapping.")
+                       f"neighbor down multiple peers [10.1.1.1, 10.1.1.2, 10.1.1.3]. bgp neighbor flapping.")
                 _pool = [_l1, _l2, _l3, _l4, _l5]
                 log_messages = _pool[:degradation_level]
         
