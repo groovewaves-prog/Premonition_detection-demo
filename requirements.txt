@@ -1,3 +1,7 @@
+# プロジェクトルートで実行
+
+# 修正版の requirements.txt を作成
+cat > requirements.txt << 'EOF'
 # =============================================================
 # AIOps Network Failure Prediction Tool - Requirements
 # Streamlit Community Cloud 対応版
@@ -16,11 +20,4 @@ sentence-transformers>=2.2.2
 # --- PyTorch CPU版 (GPU版はStreamlit Cloudの1GiB制限を超過する) ---
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
-
-# --- PyTorch Geometric (GNN機能) ---
-# ⚠️ メモリ制限注意: 追加で300-400MB使用
-# 合計メモリ使用量が1GBを超える場合はコメントアウト
-torch-geometric
-pyg-lib
-torch-scatter
-torch-sparse
+EOF
