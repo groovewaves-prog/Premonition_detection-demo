@@ -1,4 +1,5 @@
-# utils/const.py
+# utils/const.py  ―  シナリオ定義・影響度マッピング
+
 class ImpactLevel:
     """影響度レベル定義"""
     COMPLETE_OUTAGE = 100
@@ -8,6 +9,7 @@ class ImpactLevel:
     DOWNSTREAM = 50
     LOW_PRIORITY = 20
 
+# シナリオと影響度のマッピング
 SCENARIO_IMPACT_MAP = {
     "正常稼働": 0,
     "WAN全回線断": ImpactLevel.COMPLETE_OUTAGE,
@@ -31,6 +33,7 @@ SCENARIO_IMPACT_MAP = {
     "[Complex] 同時多発：FW & AP": ImpactLevel.DEGRADED_HIGH,
 }
 
+# シナリオカテゴリ
 SCENARIO_MAP = {
     "基本・広域障害": [
         "正常稼働",
