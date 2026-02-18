@@ -21,12 +21,14 @@ from enum import Enum
 try:
     from google import genai as _new_genai
     _USE_NEW_SDK = True
-    # 旧SDK互換のため型ヒント用に残す
-    import google.generativeai as genai
+    genai = _new_genai  # 統一参照
 except ImportError:
-    _USE_NEW_SDK = False
-    import google.generativeai as genai
     _new_genai = None
+    _USE_NEW_SDK = False
+    try:
+        import google.generativeai as genai  # 旧SDK互換フォールバック
+    except ImportError:
+        genai = None
 try:
     from netmiko import ConnectHandler
     NETMIKO_AVAILABLE = True
