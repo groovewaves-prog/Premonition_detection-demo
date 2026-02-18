@@ -1014,7 +1014,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
 
             # ★ Generate Fix ボタン（remediation_plan 未生成時のみ表示）
             if st.session_state.remediation_plan is None:
-                fix_label    = "🔮 予防措置プランを生成" if is_pred_rem else "✨ 修復プランを作成 (Generate Fix)"
+                fix_label    = "🔮 予防措置プランを生成 (Preventive Measures)" if is_pred_rem else "✨ 修復プランを作成 (Generate Fix)"
                 report_prereq = "「🔮 予兆の確認手順を生成」" if is_pred_rem else "「📝 詳細レポートを作成 (Generate Report)」"
 
                 if st.button(fix_label):
