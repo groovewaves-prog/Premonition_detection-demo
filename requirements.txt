@@ -2,7 +2,6 @@
 # AIOps Network Failure Prediction Tool - Requirements
 # Streamlit Community Cloud 対応版
 # =============================================================
-
 # --- 既存依存 ---
 streamlit>=1.28.0
 google-generativeai>=0.3.0
@@ -10,12 +9,18 @@ graphviz>=0.20
 netmiko>=4.0.0
 rich>=13.0.0
 pandas>=2.0.0
-
 # --- Digital Twin Engine ---
 networkx>=3.0
 numpy>=1.24.0
 sentence-transformers>=2.2.2
-
 # --- PyTorch CPU版 (GPU版はStreamlit Cloudの1GiB制限を超過する) ---
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
+
+# --- PyTorch Geometric (GNN機能) ---
+# ⚠️ メモリ制限注意: 追加で300-400MB使用
+# 合計メモリ使用量が1GBを超える場合はコメントアウト
+torch-geometric
+pyg-lib
+torch-scatter
+torch-sparse
