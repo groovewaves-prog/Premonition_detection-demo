@@ -1,7 +1,8 @@
 # digital_twin_pkg/gnn.py - Graph Neural Network モジュール
 
+from __future__ import annotations
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -16,96 +17,106 @@ try:
 except ImportError:
     HAS_PYTORCH_GEOMETRIC = False
     logger.warning("PyTorch Geometric not available. GNN features disabled.")
+    # Define dummy classes to prevent NameError
+    nn = None
+    F = None
 
 
-class NetworkGNN(nn.Module):
-    """
-    ネットワークトポロジーのためのGraph Neural Network
-    
-    ノード: ネットワーク機器
-    エッジ: 接続関係（親子、冗長性グループ）
-    特徴量: アラーム埋め込み、デバイス属性
-    """
-    
-    def __init__(
-        self,
-        input_dim: int = 768,  # BERT embedding dimension
-        hidden_dim: int = 128,
-        output_dim: int = 64,
-        num_layers: int = 3,
-        dropout: float = 0.2,
-        use_attention: bool = True
-    ):
-        super().__init__()
-        
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.num_layers = num_layers
-        self.dropout = dropout
-        self.use_attention = use_attention
-        
-        # Input projection
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        
-        # GNN layers
-        self.convs = nn.ModuleList()
-        self.bns = nn.ModuleList()
-        
-        for i in range(num_layers):
-            in_channels = hidden_dim
-            out_channels = hidden_dim if i < num_layers - 1 else output_dim
-            
-            if use_attention:
-                # Graph Attention Network
-                conv = GATConv(in_channels, out_channels, heads=4, concat=False)
-            else:
-                # Graph Convolutional Network
-                conv = GCNConv(in_channels, out_channels)
-            
-            self.convs.append(conv)
-            
-            if i < num_layers - 1:
-                self.bns.append(nn.BatchNorm1d(out_channels))
-        
-        # Output layers
-        self.fc_confidence = nn.Linear(output_dim, 1)
-        self.fc_time_to_failure = nn.Linear(output_dim, 1)
-    
-    def forward(self, x, edge_index, batch=None):
+if HAS_PYTORCH_GEOMETRIC:
+    class NetworkGNN(nn.Module):
         """
-        Args:
-            x: Node features [num_nodes, input_dim]
-            edge_index: Edge indices [2, num_edges]
-            batch: Batch assignment [num_nodes] (for batched graphs)
+        ネットワークトポロジーのためのGraph Neural Network
         
-        Returns:
-            confidence: Predicted confidence [num_nodes, 1]
-            time_to_failure: Predicted time to failure [num_nodes, 1]
+        ノード: ネットワーク機器
+        エッジ: 接続関係（親子、冗長性グループ）
+        特徴量: アラーム埋め込み、デバイス属性
         """
-        # Input projection
-        x = self.input_proj(x)
-        x = F.relu(x)
         
-        # GNN layers with residual connections
-        for i, conv in enumerate(self.convs):
-            x_in = x
-            x = conv(x, edge_index)
+        def __init__(
+            self,
+            input_dim: int = 768,  # BERT embedding dimension
+            hidden_dim: int = 128,
+            output_dim: int = 64,
+            num_layers: int = 3,
+            dropout: float = 0.2,
+            use_attention: bool = True
+        ):
+            super().__init__()
             
-            if i < self.num_layers - 1:
-                x = self.bns[i](x)
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
+            self.input_dim = input_dim
+            self.hidden_dim = hidden_dim
+            self.output_dim = output_dim
+            self.num_layers = num_layers
+            self.dropout = dropout
+            self.use_attention = use_attention
+            
+            # Input projection
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            
+            # GNN layers
+            self.convs = nn.ModuleList()
+            self.bns = nn.ModuleList()
+            
+            for i in range(num_layers):
+                in_channels = hidden_dim
+                out_channels = hidden_dim if i < num_layers - 1 else output_dim
                 
-                # Residual connection
-                if x_in.shape == x.shape:
-                    x = x + x_in
+                if use_attention:
+                    # Graph Attention Network
+                    conv = GATConv(in_channels, out_channels, heads=4, concat=False)
+                else:
+                    # Graph Convolutional Network
+                    conv = GCNConv(in_channels, out_channels)
+                
+                self.convs.append(conv)
+                
+                if i < num_layers - 1:
+                    self.bns.append(nn.BatchNorm1d(out_channels))
+            
+            # Output layers
+            self.fc_confidence = nn.Linear(output_dim, 1)
+            self.fc_time_to_failure = nn.Linear(output_dim, 1)
         
-        # Output predictions
-        confidence = torch.sigmoid(self.fc_confidence(x))
-        time_to_failure = F.relu(self.fc_time_to_failure(x))
-        
-        return confidence, time_to_failure
+        def forward(self, x, edge_index, batch=None):
+            """
+            Args:
+                x: Node features [num_nodes, input_dim]
+                edge_index: Edge indices [2, num_edges]
+                batch: Batch assignment [num_nodes] (for batched graphs)
+            
+            Returns:
+                confidence: Predicted confidence [num_nodes, 1]
+                time_to_failure: Predicted time to failure [num_nodes, 1]
+            """
+            # Input projection
+            x = self.input_proj(x)
+            x = F.relu(x)
+            
+            # GNN layers with residual connections
+            for i, conv in enumerate(self.convs):
+                x_in = x
+                x = conv(x, edge_index)
+                
+                if i < self.num_layers - 1:
+                    x = self.bns[i](x)
+                    x = F.relu(x)
+                    x = F.dropout(x, p=self.dropout, training=self.training)
+                    
+                    # Residual connection
+                    if x_in.shape == x.shape:
+                        x = x + x_in
+            
+            # Output predictions
+            confidence = torch.sigmoid(self.fc_confidence(x))
+            time_to_failure = F.relu(self.fc_time_to_failure(x))
+            
+            return confidence, time_to_failure
+else:
+    # Dummy class when PyTorch Geometric is not available
+    class NetworkGNN:
+        """Dummy NetworkGNN class when PyTorch Geometric is not installed"""
+        def __init__(self, *args, **kwargs):
+            pass
 
 
 class GNNPredictionEngine:
@@ -128,11 +139,12 @@ class GNNPredictionEngine:
         self.topology = topology
         self.children_map = children_map
         self.model = None
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         if not HAS_PYTORCH_GEOMETRIC:
             logger.warning("PyTorch Geometric not available. GNN features disabled.")
             return
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Initialize model
         self.model = NetworkGNN().to(self.device)
@@ -347,7 +359,7 @@ class GNNPredictionEngine:
 
 
 # Utility function for integration
-def create_gnn_engine(topology: Dict, children_map: Dict) -> Optional[GNNPredictionEngine]:
+def create_gnn_engine(topology: dict, children_map: dict) -> Optional[GNNPredictionEngine]:
     """
     GNN予測エンジンを作成
     
