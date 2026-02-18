@@ -166,84 +166,114 @@ def _render_weak_signal_injection():
         
         # --- リアルなログメッセージ生成 (ここが重要) ---
         # ============================================================
-        # Level = 注入シグナル件数（Level1→1件 … Level5→5件）
-        # 各メッセージは EscalationRule.semantic_phrases に確実ヒットする文言を使用
-        #
-        # Optical Decay ルール "optical":
-        #   phrases: ["rx power", "optical signal", "transceiver", "light level", "dbm"]
-        # Microburst ルール "microburst":
-        #   phrases: ["queue drops", "buffer overflow", "output drops", "asic_error", "qos-4-policer"]
-        # Route Instability ルール "route_instability":
-        #   phrases: ["route instability", "bgp neighbor", "neighbor down", "route updates", "retransmission"]
+        # ★ 改善: シミュレーションのリアリティ向上
+        # - レベルに応じてランダムにコンポーネントを選択
+        # - 低レベル: 少数のコンポーネント、断続的
+        # - 高レベル: 多数のコンポーネント、連続的
         # ============================================================
+        import random
+        
         log_messages = []
         if degradation_level > 0:
             if "Optical" in scenario_type:
+                # ★ 利用可能な光インターフェース
+                optical_interfaces = [
+                    "Gi0/0/1", "Gi0/0/2", "Gi0/0/3", "Gi0/0/4",
+                    "Te1/0/1", "Te1/0/2", "Te1/0/3", "Te1/0/4"
+                ]
+                
+                # レベルに応じて影響を受けるインターフェース数を決定
+                if degradation_level == 1:
+                    num_affected = 1  # 1個のみ
+                elif degradation_level == 2:
+                    num_affected = 2  # 2個
+                elif degradation_level == 3:
+                    num_affected = 3  # 3個
+                elif degradation_level == 4:
+                    num_affected = 4  # 4個
+                else:  # Level 5
+                    num_affected = 6  # 多数
+                
+                # ランダムに選択（ただし毎回同じにならないように）
+                selected_interfaces = random.sample(optical_interfaces, min(num_affected, len(optical_interfaces)))
+                
                 dbm = -23.0 - (degradation_level * 0.4)
-                # ★ コンポーネント情報を明示的に追加
-                # Level1: optical/rx power/dbm ヒット
-                _l1 = (f"%TRANSCEIVER-4-THRESHOLD_VIOLATION: Rx Power {dbm:.1f} dBm on Gi0/0/1 "
-                       f"(optical signal degrading). transceiver rx power below threshold.")
-                # Level2: optical signal / light level ヒット
-                _l2 = (f"%OPTICAL-3-SIGNAL_WARN: optical signal level degrading on Te1/0/1. "
-                       f"light level {dbm+1.5:.1f} dBm. transceiver rx power loss detected.")
-                # Level3: output drops / queue drops ヒット (複合劣化)
-                crc = degradation_level * 150
-                _l3 = (f"%LINK-3-ERROR: output drops increasing on Gi0/0/0 "
-                       f"(Count: {crc}/min). queue drops detected. signal integrity degraded.")
-                # Level4: buffer overflow ヒット
-                _l4 = (f"%HARDWARE-4-BUFFER: buffer overflow risk on optical interface Gi0/0/2. "
-                       f"asic_error queue drops {degradation_level*80}. rx power unstable.")
-                # Level5: retransmission / route updates ヒット (L1への波及)
-                _l5 = (f"%OSPF-4-ADJCHANGE: retransmission increase detected on Gi0/0/0. "
-                       f"route updates {degradation_level*200}/min. "
-                       f"optical signal instability causing neighbor keepalive delay.")
-                _pool = [_l1, _l2, _l3, _l4, _l5]
-                log_messages = _pool[:degradation_level]
+                
+                for i, intf in enumerate(selected_interfaces):
+                    # レベルに応じて異なるメッセージパターン
+                    if i == 0 or degradation_level >= 3:
+                        # Level1: optical/rx power/dbm ヒット
+                        _msg = (f"%TRANSCEIVER-4-THRESHOLD_VIOLATION: Rx Power {dbm:.1f} dBm on {intf} "
+                               f"(optical signal degrading). transceiver rx power below threshold.")
+                        log_messages.append(_msg)
+                    
+                    if (i == 1 or degradation_level >= 4) and len(log_messages) < degradation_level:
+                        # Level2: optical signal / light level ヒット
+                        _msg = (f"%OPTICAL-3-SIGNAL_WARN: optical signal level degrading on {intf}. "
+                               f"light level {dbm+1.5:.1f} dBm. transceiver rx power loss detected.")
+                        log_messages.append(_msg)
 
             elif "Microburst" in scenario_type:
+                # ★ 利用可能なデータインターフェース
+                data_interfaces = [
+                    "Gi0/1/0", "Gi0/1/1", "Gi0/1/2", "Gi0/1/3",
+                    "Gi0/1/4", "Gi0/1/5", "Gi0/1/6", "Gi0/1/7"
+                ]
+                
+                # レベルに応じて影響を受けるインターフェース数を決定
+                if degradation_level == 1:
+                    num_affected = 1
+                elif degradation_level == 2:
+                    num_affected = 2
+                elif degradation_level == 3:
+                    num_affected = 3
+                elif degradation_level == 4:
+                    num_affected = 4
+                else:  # Level 5
+                    num_affected = 5
+                
+                selected_interfaces = random.sample(data_interfaces, min(num_affected, len(data_interfaces)))
+                
                 drops = degradation_level * 200
-                # ★ コンポーネント情報を明示的に追加
-                # Level1: queue drops / asic_error ヒット
-                _l1 = (f"%HARDWARE-3-ASIC_ERROR: asic_error queue drops detected on Gi0/1/0 "
-                       f"(Count: {drops}). output drops on burst traffic.")
-                # Level2: buffer overflow ヒット
-                _l2 = (f"%QOS-4-BUFFER: buffer overflow risk on Gi0/1/1. "
-                       f"queue drops {drops+100}/sec. output drops increasing.")
-                # Level3: qos-4-policer ヒット
-                _l3 = (f"%QOS-4-POLICER: qos-4-policer traffic exceeding CIR on Gi0/1/2. "
-                       f"output drops {degradation_level*80}/min. buffer overflow imminent.")
-                # Level4: output drops + asic_error 複合
-                _l4 = (f"%HARDWARE-4-ASIC: asic_error escalation on Gi0/1/0. output drops {drops*2}/min. "
-                       f"queue drops buffer overflow threshold reached.")
-                # Level5: 全症状集約
-                retrans = degradation_level * 50
-                _l5 = (f"%TCP-5-RETRANSMIT: retransmission {retrans}/sec on Gi0/1/3. "
-                       f"queue drops buffer overflow. asic_error output drops critical level.")
-                _pool = [_l1, _l2, _l3, _l4, _l5]
-                log_messages = _pool[:degradation_level]
+                
+                for i, intf in enumerate(selected_interfaces):
+                    if i == 0 or degradation_level >= 3:
+                        _msg = (f"%HARDWARE-3-ASIC_ERROR: asic_error queue drops detected on {intf} "
+                               f"(Count: {drops}). output drops on burst traffic.")
+                        log_messages.append(_msg)
+                    
+                    if (i == 1 or degradation_level >= 4) and len(log_messages) < degradation_level:
+                        _msg = (f"%QOS-4-BUFFER: buffer overflow risk on {intf}. "
+                               f"queue drops {drops+100}/sec. output drops increasing.")
+                        log_messages.append(_msg)
 
             elif "Route" in scenario_type:
+                # ★ BGP peer pool
+                bgp_peers = [
+                    ("10.1.1.1", "AS65001"),
+                    ("10.1.1.2", "AS65002"),
+                    ("10.1.1.3", "AS65003"),
+                    ("10.1.1.4", "AS65004"),
+                    ("10.2.1.1", "AS65010"),
+                ]
+                
+                # レベルに応じて影響を受けるピア数を決定
+                num_affected = min(degradation_level, len(bgp_peers))
+                selected_peers = random.sample(bgp_peers, num_affected)
+                
                 updates = degradation_level * 500
-                # ★ BGP ピア情報を明示的に追加
-                # Level1: route updates / bgp neighbor ヒット
-                _l1 = (f"BGP-5-NEIGHBOR: bgp neighbor 10.1.1.1 (AS65001) route updates {updates}/min. "
-                       f"route instability warning detected.")
-                # Level2: route instability / retransmission ヒット
-                _l2 = (f"%BGP-4-INSTABILITY: route instability detected on peer 10.1.1.2 (AS65002). "
-                       f"retransmission rate increasing. neighbor down risk.")
-                # Level3: neighbor down ヒット
-                _l3 = (f"%BGP-4-ADJCHANGE: bgp neighbor 10.1.1.1 down event. "
-                       f"route updates {updates+500}/min. route instability escalating.")
-                # Level4: 複合シグナル
-                _l4 = (f"%ROUTING-3-CONVERGENCE: route instability causing convergence delay. "
-                       f"retransmission {degradation_level*30}/sec. neighbor down on peers [10.1.1.1, 10.1.1.3].")
-                # Level5: 全症状集約
-                _l5 = (f"%BGP-5-WITHDRAW: route updates withdrawal detected on peer 10.1.1.1. "
-                       f"route instability critical. retransmission burst. "
-                       f"neighbor down multiple peers [10.1.1.1, 10.1.1.2, 10.1.1.3]. bgp neighbor flapping.")
-                _pool = [_l1, _l2, _l3, _l4, _l5]
-                log_messages = _pool[:degradation_level]
+                
+                for i, (peer_ip, peer_as) in enumerate(selected_peers):
+                    if i == 0 or degradation_level >= 3:
+                        _msg = (f"BGP-5-NEIGHBOR: bgp neighbor {peer_ip} ({peer_as}) route updates {updates}/min. "
+                               f"route instability warning detected.")
+                        log_messages.append(_msg)
+                    
+                    if (i == 1 or degradation_level >= 4) and len(log_messages) < degradation_level:
+                        _msg = (f"%BGP-4-INSTABILITY: route instability detected on peer {peer_ip} ({peer_as}). "
+                               f"retransmission rate increasing. neighbor down risk.")
+                        log_messages.append(_msg)
+        
         
         # Session State に保存
         if log_messages:
@@ -264,6 +294,26 @@ def _render_weak_signal_injection():
                     st.session_state["injected_weak_signal"] = None
                     return  # 早期終了
             
+            # ★ 改善: 古い予兆をクリア（重複防止）
+            # 同じデバイスの古いシミュレーション予兆を削除
+            _prev_injected = st.session_state.get("injected_weak_signal")
+            if _prev_injected and _prev_injected.get("device_id") == target_device:
+                # 同じデバイスで連続実行 → forecast_ledger をクリア
+                dt_key = f"dt_engine_{active_site}"
+                if dt_key in st.session_state:
+                    dt_engine = st.session_state[dt_key]
+                    # simulation sourceの予兆を削除
+                    try:
+                        if dt_engine and dt_engine.storage._conn:
+                            with dt_engine.storage._db_lock:
+                                dt_engine.storage._conn.execute("""
+                                    DELETE FROM forecast_ledger
+                                    WHERE device_id=? AND status='open' AND source='simulation'
+                                """, (target_device,))
+                                dt_engine.storage._conn.commit()
+                    except Exception as e:
+                        pass  # エラーは無視
+            
             st.session_state["injected_weak_signal"] = {
                 "device_id": target_device,
                 "messages": log_messages,
@@ -273,7 +323,7 @@ def _render_weak_signal_injection():
             }
             st.info(f"💉 **{len(log_messages)}件のシグナル注入中** (Level {degradation_level}/5)")
             for i, msg in enumerate(log_messages, 1):
-                disp_msg = f"{msg[:60]}..." if len(msg) > 60 else msg
+                disp_msg = f"{msg[:80]}..." if len(msg) > 80 else msg
                 st.caption(f"{i}. `{disp_msg}`")
         else:
             st.session_state["injected_weak_signal"] = None
