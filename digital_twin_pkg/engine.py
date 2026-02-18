@@ -391,7 +391,8 @@ class DigitalTwinEngine:
             
             # ★ データのサニタイズ（機密情報の除去）
             sanitized_device_id = self._sanitize_for_llm(device_id)
-            sanitized_messages = [self._sanitize_for_llm(msg) for msg in messages[:3]]
+            # ★ 全メッセージをサニタイズ（最大50件まで）
+            sanitized_messages = [self._sanitize_for_llm(msg) for msg in messages[:50]]
             
             # Gemini API の設定
             genai.configure(api_key=api_key)
@@ -406,52 +407,95 @@ class DigitalTwinEngine:
             elif "FIREWALL" in device_id.upper():
                 device_type = "Firewall"
             
-            # ★ プロンプトの生成（サニタイズ済みデータのみ使用）
-            prompt = f"""あなたはネットワーク機器の障害対応エキスパートです。
+            # ★ プロンプトの生成（全アラームメッセージを分析させる）
+            prompt = f"""あなたは20年以上の経験を持つネットワーク機器の障害対応エキスパートです。
 
-【検出された予兆】
+【🚨 緊急: 広範囲障害が検出されました】
+
+【検出された予兆の詳細】
 - デバイスタイプ: {device_type}
 - 検出パターン: {rule_pattern}
-- 影響範囲: {affected_count}個のコンポーネント
+- **影響範囲: {affected_count}個のコンポーネント/インターフェース**
 - 予測信頼度: {confidence * 100:.0f}%
-- アラームパターン（匿名化済み）:
-{chr(10).join(f"  - {msg[:150]}" for msg in sanitized_messages)}
+- **アラーム件数: {len(sanitized_messages)}件**
 
-【重要な状況分析】
-{affected_count}個のコンポーネントで同時に{rule_pattern}パターンが検出されました。
-これは単発故障では説明困難な広範囲障害です。
+【📋 実際に検出されたアラームメッセージ（全{len(sanitized_messages)}件、匿名化済み）】
+```
+{chr(10).join(f"{i+1:3d}. {msg[:200]}" for i, msg in enumerate(sanitized_messages))}
+```
 
-【タスク】
-以下の観点で、優先順位順に3-5個の推奨アクションを生成してください：
+【🔍 あなたのタスク - ステップ1: アラームパターンの分析】
+上記の{len(sanitized_messages)}件のアラームメッセージを詳しく分析してください：
 
-1. **真因の特定**
-   - 広範囲障害（{affected_count}個）の真因を推論
-   - 電源系統、ファームウェア、環境要因を考慮
+**質問:**
+1. どのコンポーネント/インターフェースが影響を受けていますか？
+   - 同じインターフェース番号が繰り返し？
+   - 複数の異なるインターフェース？
+   - 範囲は？（例: Gi0/0/1からGi0/0/28まで）
 
-2. **優先順位付け**
-   - high: 真因の可能性が高く、影響が大きい
-   - medium: 確認すべきだが影響は中程度
-   - low: 最後の手段、または個別対応
+2. エラーの種類は？
+   - 光信号レベルの低下（Rx Power, Tx Power）？
+   - パケットドロップ？
+   - リンクフラッピング？
+   
+3. パターンの共通点は？
+   - 全て同じタイプのエラー？
+   - 特定の範囲のポート番号に集中？
+   - 時系列的なパターン？
 
-3. **具体性**
-   - 実際に実行可能な手順を提案
-   - 一般的なネットワーク機器のコマンド例を含める
+【🔴 ステップ2: 真因の推論】
+**{affected_count}個のコンポーネントで同時に{rule_pattern}パターンが検出されています。**
 
-【出力形式】
-JSON形式で出力してください（他の文字は一切含めない）：
+上記のアラームパターン分析に基づいて、**最も可能性が高い真因**を特定してください：
+
+**A. 筐体レベルの問題（全ポートに影響する場合）**
+   - 電源ユニット（PSU）の故障または電圧不安定
+   - マザーボード/制御基板の問題
+   - 筐体内の過熱（冷却ファン故障）
+
+**B. ソフトウェアレベルの問題**
+   - ファームウェア/IOS/NOS のバグ
+   - 設定ミスによる全ポート影響
+
+**C. 環境レベルの問題**
+   - データセンター空調の問題
+   - 電源供給の問題（UPS、配電盤）
+
+**判断基準:**
+- 全{affected_count}個が同時に影響 → 電源またはファームウェアの可能性が高い
+- 特定範囲のポートのみ → ラインカード、モジュールレベルの問題
+- 光信号レベル低下 → 電源、温度、または個別SFP故障
+
+【📋 ステップ3: 推奨アクション生成】
+上記の分析結果に基づいて、優先順位順に**4-5個**の具体的な推奨アクションを生成してください。
+
+**優先度の決定:**
+- **high（最優先）**: アラームパターンから推測される真因に対する対応
+  - 例: 全ポート影響 → 電源調査をhigh
+  - 例: 光信号レベル低下 → 温度・電源調査をhigh
+- **medium（推奨）**: 補助的な確認
+- **low（最後の手段）**: 個別部品交換（{affected_count}個全交換は非現実的）
+
+【出力形式 - JSON配列のみ】
+**以下の形式で4-5個のアクションを出力してください（JSON以外の文字は一切含めない）:**
 
 [
   {{
     "title": "具体的なアクション名",
-    "effect": "期待される効果",
+    "effect": "期待される効果（{affected_count}個への影響を明記）",
     "priority": "high/medium/low",
-    "rationale": "このアクションを推奨する根拠",
-    "steps": "実行手順（オプション）"
+    "rationale": "アラームパターンから推測した根拠（具体的に）",
+    "steps": "1. 実行手順\\n2. CLIコマンド例\\n3. 次のステップ"
   }}
 ]
 
-**JSON以外の文字を含めないでください**
-**機密情報（IPアドレス、ホスト名など）を含めないでください**"""
+**🚨 出力ルール:**
+1. JSON配列のみ出力（説明文・マークダウン・コメント不要）
+2. 必ず4-5個のアクション
+3. high優先度を2個以上
+4. rationaleには「アラームメッセージから○○が確認できるため」など具体的根拠
+5. 個別部品交換はlow優先度
+6. stepsには\\nで改行"""
 
             # Gemini API 呼び出し
             logger.info(f"Calling Gemini API for {affected_count} affected components")
@@ -713,11 +757,22 @@ JSON形式で出力してください（他の文字は一切含めない）：
             # --- 予測結果に「運用者向けの具体的な知識」を注入 ---
             
             # ★ LLMベースの動的推奨アクション生成（広範囲障害に対応）
+            # affected_count: メッセージから抽出されるコンポーネント数を計算
+            unique_components = set()
+            for _, _, msg in matched_signals:
+                # メッセージからコンポーネント名を抽出（例: Gi0/0/1, Te1/0/1）
+                import re
+                components = re.findall(r'\b(?:Gi|Te|Fa|Et)\d+/\d+/\d+|\b(?:Gi|Te|Fa|Et)\d+/\d+', msg)
+                unique_components.update(components)
+            
+            # コンポーネント数がカウントできない場合はシグナル数を使用
+            component_count = len(unique_components) if unique_components else len(matched_signals)
+            
             smart_actions = self._generate_smart_recommendations(
                 rule_pattern=primary_rule.pattern,
-                affected_count=len(matched_signals),
+                affected_count=component_count,  # ★ 修正: コンポーネント数を使用
                 confidence=confidence,
-                messages=[s[2] for s in matched_signals[:3]],
+                messages=[s[2] for s in matched_signals],  # ★ 全メッセージを送信（[:3]を削除）
                 device_id=dev_id,
                 base_actions=primary_rule.recommended_actions,
                 llm_cache=llm_recommendations_cache  # ★ バッチ生成されたキャッシュを使用
