@@ -272,432 +272,160 @@ class DigitalTwinEngine:
         
         return sanitized
 
-    def _batch_generate_llm_recommendations(
-        self,
-        candidates: set,
-        msg_map: Dict[str, List[str]]
-    ) -> Dict[str, List[Dict[str, str]]]:
-        """
-        複数デバイスの推奨アクションをバッチ生成（コスト削減・性能向上）
-        
-        同じルールパターンの予兆をグループ化し、1回のLLM呼び出しで処理
-        
-        Args:
-            candidates: 予兆候補デバイスIDのセット
-            msg_map: デバイスID → アラームメッセージのマップ
-        
-        Returns:
-            ルールパターン → 推奨アクションのマップ
-        """
-        from collections import defaultdict
-        
-        # ルールパターンでグループ化
-        pattern_groups = defaultdict(list)
-        
-        for dev_id in candidates:
-            messages = msg_map.get(dev_id, [])
-            if not messages:
-                continue
-            
-            # 主要ルールを特定
-            matched_signals = []
-            for msg in messages:
-                rule, quality = self._match_rule(msg)
-                if rule and quality >= 0.30 and rule.pattern != "generic_error":
-                    matched_signals.append((rule, quality, msg))
-            
-            if not matched_signals:
-                rule, quality = self._match_rule(messages[0])
-                if not rule:
-                    continue
-                matched_signals = [(rule, quality, messages[0])]
-            
-            matched_signals.sort(key=lambda x: x[1], reverse=True)
-            primary_rule, primary_quality, primary_msg = matched_signals[0]
-            
-            pattern_groups[primary_rule.pattern].append({
-                'device_id': dev_id,
-                'messages': [s[2] for s in matched_signals[:3]],
-                'affected_count': len(matched_signals),
-                'confidence': self._calculate_confidence(primary_rule, dev_id, primary_quality)
-            })
-        
-        # バッチLLM呼び出し
-        llm_cache = {}
-        WIDE_RANGE_THRESHOLD = 5
-        
-        for pattern, devices in pattern_groups.items():
-            total_affected = sum(d['affected_count'] for d in devices)
-            
-            # 広範囲障害の場合のみLLM呼び出し
-            if total_affected >= WIDE_RANGE_THRESHOLD:
-                # 代表的なデバイスのデータを使用
-                representative = max(devices, key=lambda d: d['affected_count'])
-                
-                llm_actions = self._generate_actions_with_gemini(
-                    rule_pattern=pattern,
-                    affected_count=total_affected,
-                    confidence=sum(d['confidence'] for d in devices) / len(devices),
-                    messages=representative['messages'],
-                    device_id=representative['device_id']
-                )
-                
-                if llm_actions:
-                    llm_cache[pattern] = llm_actions
-                    logger.info(f"Batch LLM: Generated actions for {pattern} "
-                              f"({len(devices)} devices, {total_affected} total affected)")
-        
-        return llm_cache
-
-    def _generate_actions_with_gemini(
-        self,
-        rule_pattern: str,
-        affected_count: int,
-        confidence: float,
-        messages: List[str],
-        device_id: str,
-        api_key: Optional[str] = None,
-    ) -> Optional[List[Dict[str, str]]]:
-        """
-        Gemini API を使って状況に応じた推奨アクションを動的生成
-
-        ⚠️ セキュリティ: データをサニタイズしてから送信
-
-        Args:
-            rule_pattern: 検出されたルールパターン
-            affected_count: 影響を受けたコンポーネント数
-            confidence: 予測信頼度
-            messages: アラームメッセージのリスト
-            device_id: デバイスID
-            api_key: 呼び出し元から渡されたAPIキー（優先）
-
-        Returns:
-            推奨アクションのリスト、または None（生成失敗時）
-        """
-        try:
-            import os
-            import json
-
-            # ★ LLM送信の設定確認（オプトアウト可能）
-            enable_llm = os.environ.get("ENABLE_LLM_RECOMMENDATIONS", "true").lower()
-            if enable_llm not in ["true", "1", "yes"]:
-                logger.info("LLM recommendations disabled by configuration")
-                return None
-
-            # API キーの取得: 引数 → 環境変数 → st.secrets の順で探す
-            _api_key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-            if not _api_key:
-                try:
-                    import streamlit as _st
-                    _api_key = _st.secrets.get("GOOGLE_API_KEY", "")
-                except Exception:
-                    pass
-            if not _api_key:
-                logger.warning("GOOGLE_API_KEY not found. Using static recommendations.")
-                return None
-
-            # ★ データのサニタイズ（機密情報の除去）
-            sanitized_device_id = self._sanitize_for_llm(device_id)
-            # ★ 全メッセージをサニタイズ（最大50件まで）
-            sanitized_messages = [self._sanitize_for_llm(msg) for msg in messages[:50]]
-            # ★ api_key は絶対にプロンプトに含めない（二重チェック）
-            # _api_key 変数はここより下で使わない（API呼び出し専用）
-
-            # 新SDK (google-genai) 優先、旧SDK にフォールバック
-            try:
-                from google import genai as _genai
-                _client = _genai.Client(api_key=_api_key)
-                _use_new_sdk = True
-            except ImportError:
-                import google.generativeai as _genai_legacy
-                _genai_legacy.configure(api_key=_api_key)
-                _model_obj = _genai_legacy.GenerativeModel("gemma-3-12b-it")
-                _use_new_sdk = False
-
-            # デバイスタイプの推定（一般化）
-            device_type = "Network Device"
-            if "ROUTER" in device_id.upper():
-                device_type = "Router"
-            elif "SWITCH" in device_id.upper():
-                device_type = "Switch"
-            elif "FIREWALL" in device_id.upper():
-                device_type = "Firewall"
-
-            # ★ プロンプトの生成（全アラームメッセージを分析させる）
-            prompt = f"""あなたは20年以上の経験を持つネットワーク機器の障害対応エキスパートです。
-
-【🚨 緊急: 広範囲障害が検出されました】
-
-【検出された予兆の詳細】
-- デバイスタイプ: {device_type}
-- 検出パターン: {rule_pattern}
-- **影響範囲: {affected_count}個のコンポーネント/インターフェース**
-- 予測信頼度: {confidence * 100:.0f}%
-- **アラーム件数: {len(sanitized_messages)}件**
-
-【📋 実際に検出されたアラームメッセージ（全{len(sanitized_messages)}件、匿名化済み）】
-```
-{chr(10).join(f"{i+1:3d}. {msg[:200]}" for i, msg in enumerate(sanitized_messages))}
-```
-
-【🔍 あなたのタスク - ステップ1: アラームパターンの分析】
-上記の{len(sanitized_messages)}件のアラームメッセージを詳しく分析してください：
-
-**質問:**
-1. どのコンポーネント/インターフェースが影響を受けていますか？
-   - 同じインターフェース番号が繰り返し？
-   - 複数の異なるインターフェース？
-   - 範囲は？（例: Gi0/0/1からGi0/0/28まで）
-
-2. エラーの種類は？
-   - 光信号レベルの低下（Rx Power, Tx Power）？
-   - パケットドロップ？
-   - リンクフラッピング？
-   
-3. パターンの共通点は？
-   - 全て同じタイプのエラー？
-   - 特定の範囲のポート番号に集中？
-   - 時系列的なパターン？
-
-【🔴 ステップ2: 真因の推論】
-**{affected_count}個のコンポーネントで同時に{rule_pattern}パターンが検出されています。**
-
-上記のアラームパターン分析に基づいて、**最も可能性が高い真因**を特定してください：
-
-**A. 筐体レベルの問題（全ポートに影響する場合）**
-   - 電源ユニット（PSU）の故障または電圧不安定
-   - マザーボード/制御基板の問題
-   - 筐体内の過熱（冷却ファン故障）
-
-**B. ソフトウェアレベルの問題**
-   - ファームウェア/IOS/NOS のバグ
-   - 設定ミスによる全ポート影響
-
-**C. 環境レベルの問題**
-   - データセンター空調の問題
-   - 電源供給の問題（UPS、配電盤）
-
-**判断基準:**
-- 全{affected_count}個が同時に影響 → 電源またはファームウェアの可能性が高い
-- 特定範囲のポートのみ → ラインカード、モジュールレベルの問題
-- 光信号レベル低下 → 電源、温度、または個別SFP故障
-
-【📋 ステップ3: 推奨アクション生成】
-上記の分析結果に基づいて、優先順位順に**4-5個**の具体的な推奨アクションを生成してください。
-
-**優先度の決定:**
-- **high（最優先）**: アラームパターンから推測される真因に対する対応
-  - 例: 全ポート影響 → 電源調査をhigh
-  - 例: 光信号レベル低下 → 温度・電源調査をhigh
-- **medium（推奨）**: 補助的な確認
-- **low（最後の手段）**: 個別部品交換（{affected_count}個全交換は非現実的）
-
-【出力形式 - JSON配列のみ】
-**以下の形式で4-5個のアクションを出力してください（JSON以外の文字は一切含めない）:**
-
-[
-  {{
-    "title": "具体的なアクション名",
-    "effect": "期待される効果（{affected_count}個への影響を明記）",
-    "priority": "high/medium/low",
-    "rationale": "アラームパターンから推測した根拠（具体的に）",
-    "steps": "1. 実行手順\\n2. CLIコマンド例\\n3. 次のステップ"
-  }}
-]
-
-**🚨 出力ルール:**
-1. JSON配列のみ出力（説明文・マークダウン・コメント不要）
-2. 必ず4-5個のアクション
-3. high優先度を2個以上
-4. rationaleには「アラームメッセージから○○が確認できるため」など具体的根拠
-5. 個別部品交換はlow優先度
-6. stepsには\\nで改行"""
-
-            # Gemini API 呼び出し（新SDK/旧SDK両対応）
-            logger.info(f"Calling Gemini API for {affected_count} affected components")
-            if _use_new_sdk:
-                _resp = _client.models.generate_content(
-                    model="gemma-3-12b-it",
-                    contents=prompt
-                )
-                response_text = _resp.text.strip()
-            else:
-                _resp = _model_obj.generate_content(prompt)
-                response_text = _resp.text.strip()
-            
-            # JSON パース
-            # Markdown コードブロックを除去
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0].strip()
-            
-            actions = json.loads(response_text)
-            
-            # バリデーション
-            if not isinstance(actions, list):
-                logger.warning("Gemini API returned invalid format (not a list)")
-                return None
-            
-            # 必須フィールドの確認
-            validated_actions = []
-            for action in actions:
-                if all(k in action for k in ["title", "effect", "priority", "rationale"]):
-                    validated_actions.append(action)
-            
-            if validated_actions:
-                logger.info(f"Generated {len(validated_actions)} actions using Gemini API")
-                return validated_actions
-            else:
-                logger.warning("No valid actions in Gemini API response")
-                return None
-        
-        except Exception as e:
-            logger.warning(f"Failed to generate actions with Gemini API: {e}")
-            return None
 
     def _generate_smart_recommendations(
         self,
         rule_pattern: str,
         affected_count: int,
-        confidence: float,
-        messages: List[str],
-        device_id: str,
-        base_actions: List[Dict[str, str]],
-        llm_cache: Optional[Dict[str, List[Dict[str, str]]]] = None
-    ) -> List[Dict[str, str]]:
+        base_actions: list,
+    ) -> list:
         """
-        LLMを使って状況に応じた推奨アクションを動的生成
-        
-        広範囲障害の場合は真因（電源/ファームウェア/環境）を推論
-        
-        Args:
-            llm_cache: バッチ生成された推奨アクションのキャッシュ
+        シグナル件数（affected_count）に基づいて静的ルールで推奨アクションを決定する。
+        外部LLMは使用しない（即時・決定論的・優先順序を明示制御）。
+
+        閾値:
+          1〜2件 : 個別部品故障 → 単体SFP/インターフェース対応
+          3〜4件 : ラインカード/モジュール単位の問題
+          5件以上: 筐体レベル（電源・ファームウェア・基板）の問題
         """
-        # 広範囲障害の閾値
         WIDE_RANGE_THRESHOLD = 5
-        
-        # 広範囲障害でない場合は固定アクションを返す
-        if affected_count < WIDE_RANGE_THRESHOLD:
-            return base_actions
-        
-        # ★ キャッシュから取得（バッチ生成済み）
-        if llm_cache and rule_pattern in llm_cache:
-            logger.debug(f"Using cached LLM recommendations for {rule_pattern}")
-            return llm_cache[rule_pattern]
-        
-        # ★ キャッシュになければ個別にGemini API呼び出し（フォールバック）
-        llm_actions = self._generate_actions_with_gemini(
-            rule_pattern=rule_pattern,
-            affected_count=affected_count,
-            confidence=confidence,
-            messages=messages,
-            device_id=device_id
-        )
-        
-        if llm_actions:
-            # LLM生成が成功した場合はそれを返す
-            return llm_actions
-        
-        # LLM生成が失敗した場合はフォールバック（静的な高度なアクション）
-        enhanced_actions = []
-        
+        MID_RANGE_THRESHOLD  = 3
+
         if "optical" in rule_pattern:
-            enhanced_actions = [
-                {
-                    "title": "⚠️ 筐体電源系統の調査（最優先）",
-                    "effect": f"電源ユニット故障による{affected_count}個の光モジュール同時劣化を解消",
-                    "priority": "high",
-                    "rationale": f"{affected_count}個の光モジュール同時劣化は単発故障では説明困難。電源系統の問題を疑う。"
-                },
-                {
-                    "title": "⚠️ IOS/ファームウェアのバグ調査",
-                    "effect": "ソフトウェア起因の誤検知/制御異常を解消",
-                    "priority": "high",
-                    "rationale": "広範囲障害はファームウェアバグの可能性あり"
-                },
-                {
-                    "title": "制御基板の温度/環境調査",
-                    "effect": "筐体内過熱による劣化を解消",
-                    "priority": "medium",
-                    "rationale": "環境要因による全モジュール影響を確認"
-                },
-                {
-                    "title": "SFPモジュールの個別交換（最後の手段）",
-                    "effect": "個別モジュール故障の解消",
-                    "priority": "low",
-                    "rationale": f"{affected_count}個全交換は非現実的、上記を優先"
-                }
-            ]
-        
+            if affected_count >= WIDE_RANGE_THRESHOLD:
+                return [
+                    {
+                        "title": "筐体電源系統の確認（PSU冗長・負荷状況）",
+                        "effect": f"{affected_count}個の光モジュール同時劣化の主因を排除",
+                        "priority": "high",
+                        "rationale": f"{affected_count}個が同時劣化 → 単発SFP故障では説明困難。電源電圧不安定を最初に疑う。",
+                        "steps": "1. show environment power\n2. show platform\n3. 各PSUの出力電圧/負荷率を確認"
+                    },
+                    {
+                        "title": "筐体内温度・冷却ファンの確認",
+                        "effect": "過熱による光モジュール特性劣化を解消",
+                        "priority": "high",
+                        "rationale": "広範囲の光信号劣化は筐体内過熱でも発生する。",
+                        "steps": "1. show environment temperature\n2. show environment fan\n3. データセンター空調状況も確認"
+                    },
+                    {
+                        "title": "IOS/ファームウェアバージョンの確認",
+                        "effect": "ソフトウェア起因の誤検知・光制御異常を解消",
+                        "priority": "medium",
+                        "rationale": "既知のバグで光パワー読み値が異常になるケースあり。リリースノート確認。",
+                        "steps": "1. show version\n2. ベンダーの既知障害情報を照合\n3. 該当バグがあればパッチ適用を検討"
+                    },
+                    {
+                        "title": "SFPモジュールの個別確認（最終手段）",
+                        "effect": "残留する個別モジュール故障を解消",
+                        "priority": "low",
+                        "rationale": f"上記で解消しない場合のみ。{affected_count}個全交換は費用対効果が低い。",
+                        "steps": "1. show interfaces transceiver\n2. Rx/Tx Powerが閾値外のポートを特定\n3. 該当SFPのみ交換"
+                    },
+                ]
+            elif affected_count >= MID_RANGE_THRESHOLD:
+                return [
+                    {
+                        "title": "該当ラインカード／スロットの確認",
+                        "effect": f"{affected_count}個が同一カードに集中している場合、カード交換で解決",
+                        "priority": "high",
+                        "rationale": "複数ポートが同じラインカードに属している場合はカード障害が主因。",
+                        "steps": "1. show interfaces transceiver で影響ポートのスロットを確認\n2. show platform slot で該当スロットの状態を確認\n3. 同スロット集中なら予備カードと交換"
+                    },
+                    {
+                        "title": "光ファイバーの接続状態・清掃",
+                        "effect": "コネクタ汚れ・曲げによる光損失を回復",
+                        "priority": "medium",
+                        "rationale": "複数ポートで同時に光損失 → パッチパネル側の共通障害も疑う。",
+                        "steps": "1. 光コネクタを顕微鏡検査\n2. アルコール綿棒で清掃\n3. Rx Powerを再測定"
+                    },
+                    {
+                        "title": "SFPモジュールの個別確認",
+                        "effect": "故障モジュールを特定・交換",
+                        "priority": "low",
+                        "rationale": "上記で改善しない場合に個別SFPを交換。",
+                        "steps": "1. show interfaces transceiver detail\n2. Rx Power最低値のポートから順に交換"
+                    },
+                ]
+            else:
+                return base_actions
+
         elif "microburst" in rule_pattern:
-            enhanced_actions = [
-                {
-                    "title": "⚠️ ASIC/ハードウェアの調査",
-                    "effect": f"{affected_count}個のインターフェースでのバッファ問題を解消",
-                    "priority": "high",
-                    "rationale": "広範囲のqueue dropsはASIC/チップセット問題の可能性"
-                },
-                {
-                    "title": "IOS/ファームウェアのバグ確認",
-                    "effect": "QoS処理の異常を解消",
-                    "priority": "high",
-                    "rationale": "複数ポートでの同時発生はソフトウェアバグの可能性"
-                },
-                {
-                    "title": "トラフィックパターンの分析",
-                    "effect": "異常トラフィックの検出・対処",
-                    "priority": "medium",
-                    "rationale": "DDoS攻撃や異常トラフィックの可能性を確認"
-                },
-                {
-                    "title": "QoSポリシーの調整",
-                    "effect": "バッファ割り当ての最適化",
-                    "priority": "low",
-                    "rationale": "根本原因解決後の最適化"
-                }
-            ]
-        
+            if affected_count >= WIDE_RANGE_THRESHOLD:
+                return [
+                    {
+                        "title": "ASIC／チップセットの診断",
+                        "effect": f"{affected_count}個のインターフェースでのバッファ問題を根本解消",
+                        "priority": "high",
+                        "rationale": "広範囲のqueue dropsはASICのバグ・故障の可能性が高い。",
+                        "steps": "1. show platform resources\n2. show platform hardware\n3. ベンダーのASIC既知バグを照合"
+                    },
+                    {
+                        "title": "IOS/ファームウェアのバグ確認",
+                        "effect": "QoS処理の異常を解消",
+                        "priority": "high",
+                        "rationale": "複数ポート同時発生はソフトウェアバグの可能性。",
+                        "steps": "1. show version\n2. リリースノートでQoS関連のバグを確認\n3. 修正済みバージョンへのアップグレード"
+                    },
+                    {
+                        "title": "トラフィックパターンの分析",
+                        "effect": "異常トラフィック発生源の特定・遮断",
+                        "priority": "medium",
+                        "rationale": "DDoS・異常フローによる全ポート同時輻輳の可能性。",
+                        "steps": "1. show interfaces | include drops\n2. NetFlow/sFlowで異常フローを特定\n3. ACLで遮断"
+                    },
+                    {
+                        "title": "QoSポリシーの最適化",
+                        "effect": "バッファ割り当てを改善し一時的な輻輳を緩和",
+                        "priority": "low",
+                        "rationale": "根本解決後の最適化として実施。",
+                        "steps": "1. show policy-map interface\n2. キュー深度・重み付けを調整"
+                    },
+                ]
+            else:
+                return base_actions
+
         elif "route_instability" in rule_pattern or "bgp" in rule_pattern:
-            enhanced_actions = [
-                {
-                    "title": "⚠️ BGP設定の包括的レビュー",
-                    "effect": f"{affected_count}個のピアでの不安定さを解消",
-                    "priority": "high",
-                    "rationale": "複数ピアでの同時発生は設定ミスの可能性"
-                },
-                {
-                    "title": "上流ISPとの連携",
-                    "effect": "ISP側の問題を特定・対処",
-                    "priority": "high",
-                    "rationale": "広範囲ルート不安定はISP側問題の可能性"
-                },
-                {
-                    "title": "IOS/ファームウェアの確認",
-                    "effect": "BGP実装のバグを回避",
-                    "priority": "medium",
-                    "rationale": "BGP処理の異常による不安定さを確認"
-                },
-                {
-                    "title": "BGPフラップダンピングの調整",
-                    "effect": "不安定な経路の抑制",
-                    "priority": "low",
-                    "rationale": "症状の緩和（根本解決ではない）"
-                }
-            ]
-        
+            if affected_count >= MID_RANGE_THRESHOLD:
+                return [
+                    {
+                        "title": "BGP設定の包括的レビュー",
+                        "effect": f"{affected_count}個のピアの不安定さを解消",
+                        "priority": "high",
+                        "rationale": "複数ピア同時不安定 → 設定ミス or 上流ISP側の問題を最初に確認。",
+                        "steps": "1. show bgp summary\n2. 各ピアのhold-timer/keepalive設定を確認\n3. 上流ISPにNOC問い合わせ"
+                    },
+                    {
+                        "title": "IOS/ファームウェアのBGP実装確認",
+                        "effect": "BGP処理バグによる経路不安定を回避",
+                        "priority": "medium",
+                        "rationale": "既知のBGP実装バグで複数ピア同時フラップが発生するケースあり。",
+                        "steps": "1. show version\n2. ベンダーの既知BGPバグを照合\n3. 修正バージョンへのアップグレードを検討"
+                    },
+                    {
+                        "title": "BGPフラップダンピングの設定",
+                        "effect": "不安定なピアの経路広報を抑制",
+                        "priority": "low",
+                        "rationale": "根本解決が難しい場合の緩和策。",
+                        "steps": "1. bgp dampening コマンドを設定\n2. show bgp dampened-paths で抑制状況を確認"
+                    },
+                ]
+            else:
+                return base_actions
+
         else:
-            # デフォルト: 基本アクション + 広範囲調査を追加
-            enhanced_actions = base_actions + [
-                {
-                    "title": "⚠️ システム全体の健全性確認",
-                    "effect": f"{affected_count}個のコンポーネント障害の根本原因を特定",
-                    "priority": "high",
-                    "rationale": "広範囲障害は電源/ファームウェア/環境の問題を疑う"
-                }
-            ]
-        
-        return enhanced_actions if enhanced_actions else base_actions
+            if affected_count >= WIDE_RANGE_THRESHOLD:
+                return base_actions + [
+                    {
+                        "title": "システム全体の健全性確認",
+                        "effect": f"{affected_count}件のシグナルの根本原因を特定",
+                        "priority": "high",
+                        "rationale": "広範囲のシグナル発生は電源・ファームウェア・環境問題を疑う。",
+                        "steps": "1. show environment all\n2. show version\n3. ベンダーサポートへのエスカレーション検討"
+                    }
+                ]
+            return base_actions
+
 
     def predict(self, analysis_results: List[Dict], msg_map: Dict[str, List[str]], alarms: Optional[List] = None) -> List[Dict]:
         self.reload_all()
@@ -709,12 +437,6 @@ class DigitalTwinEngine:
         processed_devices = set()
         multi_signal_boost = 0.05
         
-        # ★ バッチLLM推奨アクション生成（コスト削減・性能向上）
-        llm_recommendations_cache = self._batch_generate_llm_recommendations(
-            candidates=candidates,
-            msg_map=msg_map
-        )
-
         for dev_id in candidates:
             if dev_id in processed_devices: continue
             messages = msg_map.get(dev_id, [])
@@ -777,28 +499,20 @@ class DigitalTwinEngine:
             if dev_id in self.children_map:
                 impact_count = len(self.children_map[dev_id])
             
-            # --- 予測結果に「運用者向けの具体的な知識」を注入 ---
-            
-            # ★ LLMベースの動的推奨アクション生成（広範囲障害に対応）
-            # affected_count: メッセージから抽出されるコンポーネント数を計算
+            # ★ シグナル件数（matched_signals数）を affected_count として使用
+            # インターフェース名の有無に関わらずシグナル数が実態を最も正確に表す
+            import re as _re_comp
             unique_components = set()
-            for _, _, msg in matched_signals:
-                # メッセージからコンポーネント名を抽出（例: Gi0/0/1, Te1/0/1）
-                import re
-                components = re.findall(r'\b(?:Gi|Te|Fa|Et)\d+/\d+/\d+|\b(?:Gi|Te|Fa|Et)\d+/\d+', msg)
-                unique_components.update(components)
-            
-            # コンポーネント数がカウントできない場合はシグナル数を使用
+            for _, _, _m in matched_signals:
+                unique_components.update(
+                    _re_comp.findall(r'\b(?:Gi|Te|Fa|Et)\d+/\d+/\d+|\b(?:Gi|Te|Fa|Et)\d+/\d+', _m))
+            # インターフェース名が抽出できた場合はそれを、できない場合はシグナル件数を使用
             component_count = len(unique_components) if unique_components else len(matched_signals)
-            
+
             smart_actions = self._generate_smart_recommendations(
                 rule_pattern=primary_rule.pattern,
-                affected_count=component_count,  # ★ 修正: コンポーネント数を使用
-                confidence=confidence,
-                messages=[s[2] for s in matched_signals],  # ★ 全メッセージを送信（[:3]を削除）
-                device_id=dev_id,
+                affected_count=component_count,
                 base_actions=primary_rule.recommended_actions,
-                llm_cache=llm_recommendations_cache  # ★ バッチ生成されたキャッシュを使用
             )
             
             pred = {
@@ -996,70 +710,34 @@ class DigitalTwinEngine:
                     time_to_failure_hours = _ttf_hours,
                     predicted_failure_datetime = _failure_dt_str,
                 )
-
-                # ★ LLM強化: degradation_level >= 3 で推奨アクションを文脈対応に強化
-                # all_messages が attrs にあれば全メッセージを使用（バッチモード）
-                # なければ単一メッセージから推定
+                # ★ シグナル件数ベースの静的ルールで推奨アクションを決定（外部LLM不使用）
                 import re as _re_comp
-
-                _deg_level   = int((attrs or {}).get("degradation_level", 1))
-                _api_key_arg = (attrs or {}).get("api_key", "")
-
-                # ★ 全メッセージを取得（attrs["all_messages"] 優先）
                 _all_messages: List[str] = (attrs or {}).get("all_messages", [])
                 if not _all_messages:
                     _all_messages = [msg]
 
-                # affected_count: 全メッセージから抽出したコンポーネント数 OR signal数
+                # affected_count: 全メッセージから抽出したインターフェース数 or シグナル件数
+                # ※ deg_level * 2 による過大評価は行わない
                 _all_components: set = set()
                 for _am in _all_messages:
                     _all_components.update(
                         _re_comp.findall(
                             r'\b(?:Gi|Te|Fa|Et)\d+/\d+/\d+|\b(?:Gi|Te|Fa|Et)\d+/\d+', _am or ""))
-                _affected_est = max(
-                    len(_all_components) if _all_components else 1,
-                    len(_all_messages),          # シグナル件数
-                    _deg_level * 2               # レベル係数
-                )
+                _affected_est = len(_all_components) if _all_components else len(_all_messages)
 
                 _rule_pat  = str(getattr(rule, "pattern", "unknown"))
                 _base_acts = list(getattr(rule, "recommended_actions", []) or [])
 
-                if _deg_level >= 3:
-                    # LLMへのリクエストを試みる（失敗でも必ず静的強化にフォールバック）
-                    _llm_actions = None
-                    try:
-                        _llm_actions = self._generate_actions_with_gemini(
-                            rule_pattern   = _rule_pat,
-                            affected_count = _affected_est,
-                            confidence     = conf,
-                            messages       = _all_messages,   # ★ 全メッセージを渡す
-                            device_id      = device_id,
-                            api_key        = _api_key_arg or None,
-                        )
-                    except Exception as _llm_err:
-                        logger.debug(f"LLM enhancement exception: {_llm_err}")
+                _smart_acts = self._generate_smart_recommendations(
+                    rule_pattern   = _rule_pat,
+                    affected_count = _affected_est,
+                    base_actions   = _base_acts,
+                )
+                if _smart_acts != _base_acts:
+                    pr.recommended_actions = _smart_acts
+                    logger.debug(f"[Static] smart actions applied for {device_id} "
+                                 f"(pattern={_rule_pat}, affected={_affected_est})")
 
-                    if _llm_actions:
-                        # LLM成功: 動的アクションを採用
-                        pr.recommended_actions = _llm_actions
-                        logger.info(f"[LLM] dynamic actions applied for {device_id} "
-                                    f"(pattern={_rule_pat}, affected={_affected_est})")
-                    else:
-                        # LLM失敗/None: 必ず静的強化フォールバックを実行
-                        _static_enhanced = self._generate_smart_recommendations(
-                            rule_pattern   = _rule_pat,
-                            affected_count = _affected_est,
-                            confidence     = conf,
-                            messages       = [msg],
-                            device_id      = device_id,
-                            base_actions   = _base_acts,
-                            llm_cache      = None,
-                        )
-                        if _static_enhanced and _static_enhanced != _base_acts:
-                            pr.recommended_actions = _static_enhanced
-                            logger.debug(f"[Static] enhanced actions applied for {device_id} "
-                                         f"(pattern={_rule_pat}, affected={_affected_est})")
                 results.append(pr)
             except Exception:
                 continue
@@ -1101,13 +779,7 @@ class DigitalTwinEngine:
             if not isinstance(attrs, dict):
                 attrs = {"raw_attrs": str(attrs)}
 
-            # ★ api_key を attrs に注入して predict() まで伝搬（LLM強化に使用）
-            _req_api_key = request.get("api_key", "")
-            if _req_api_key and "api_key" not in attrs:
-                attrs = dict(attrs)
-                attrs["api_key"] = _req_api_key
-
-            # ★ 全メッセージを attrs 経由で predict() に伝搬（LLM文脈強化用）
+            # ★ 全メッセージを attrs 経由で predict() に伝搬（シグナル件数集計用）
             attrs = dict(attrs)
             attrs["all_messages"] = messages_list
 
