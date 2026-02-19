@@ -1279,7 +1279,19 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         # グループ統計情報
                         _confidences = [float(p.get("confidence", 0.0)) for p in _pred_group]
                         _avg_conf = sum(_confidences) / len(_confidences) if _confidences else 0.0
-                        
+
+                        # ★ 全レコードを横断して影響インターフェースとシグナル数を集計
+                        _all_ifaces: set = set()
+                        _total_signals: int = 0
+                        for _fp2 in _pred_group:
+                            _ifaces = _fp2.get("affected_interfaces", [])
+                            _all_ifaces.update(_ifaces)
+                            _sc = int(_fp2.get("signal_count", 0))
+                            if _sc:
+                                _total_signals = max(_total_signals, _sc)
+                        # インターフェース名が無い場合（BGP peer等）はシグナル数で代替
+                        _iface_count  = len(_all_ifaces) if _all_ifaces else _total_signals
+
                         # 最古と最新の検出時刻（Unix timestamp → 人間可読）
                         _timestamps = []
                         for p in _pred_group:
@@ -1307,27 +1319,52 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         else:
                             _oldest_dt = "不明"
                             _newest_dt = "不明"
-                            _relative = ""
-                        
+                            _relative  = ""
+
+                        # ★ ヘッダー文字列: 影響インターフェース数が取れる場合はそれを表示
+                        if _iface_count > 0:
+                            _header_suffix = f"影響 {_iface_count}インターフェース | 信頼度: {_avg_conf*100:.0f}% | 最新: {_relative}"
+                        else:
+                            _header_suffix = f"信頼度: {_avg_conf*100:.0f}% | 最新: {_relative}"
+
                         # グループヘッダー（折りたたみ可能）
                         with st.expander(
-                            f"🔖 {_rule_pattern}  ({_group_size}件 | 平均信頼度: {_avg_conf*100:.0f}% | 最新: {_relative})",
-                            expanded=(_group_size <= 3)  # 3件以下は自動展開
+                            f"🔖 {_rule_pattern}  ({_header_suffix})",
+                            expanded=True
                         ):
-                            st.markdown(
-                                f"<div style='background:#F5F5F5;padding:6px 10px;border-radius:4px;margin-bottom:8px;'>"
-                                f"<small>📅 検出期間: {_oldest_dt} 〜 {_newest_dt}</small>"
-                                f"</div>",
-                                unsafe_allow_html=True
-                            )
+                            # ★ 影響インターフェース一覧（実運用で有用な情報）
+                            if _all_ifaces:
+                                _sorted_ifaces = sorted(_all_ifaces)
+                                _iface_chips = " ".join(
+                                    f"<code style='background:#E3F2FD;padding:2px 6px;"
+                                    f"border-radius:3px;font-size:11px;margin:1px;'>{_if}</code>"
+                                    for _if in _sorted_ifaces
+                                )
+                                st.markdown(
+                                    f"<div style='background:#F5F5F5;padding:6px 10px;"
+                                    f"border-radius:4px;margin-bottom:8px;'>"
+                                    f"<small>📡 影響インターフェース ({len(_sorted_ifaces)}個): "
+                                    f"{_iface_chips}</small><br>"
+                                    f"<small>📊 検出シグナル数: {_total_signals}件 | "
+                                    f"📅 検出期間: {_oldest_dt} 〜 {_newest_dt}</small>"
+                                    f"</div>",
+                                    unsafe_allow_html=True
+                                )
+                            else:
+                                st.markdown(
+                                    f"<div style='background:#F5F5F5;padding:6px 10px;border-radius:4px;margin-bottom:8px;'>"
+                                    f"<small>📅 検出期間: {_oldest_dt} 〜 {_newest_dt}</small>"
+                                    f"</div>",
+                                    unsafe_allow_html=True
+                                )
                             
                             # 一括操作ボタン
                             _bulk_col1, _bulk_col2, _bulk_col3 = st.columns([1, 1, 2])
                             with _bulk_col1:
                                 if st.button(
-                                    f"✅ 一括対応済み ({_group_size}件)",
+                                    f"✅ 対応済みにする",
                                     key=f"bulk_handled_{_rule_pattern[:20]}",
-                                    help=f"{_group_size}件の予兆をまとめて対応済みにします",
+                                    help=f"この予兆を対応済みにします",
                                     use_container_width=True
                                 ):
                                     _success_count = 0
@@ -1339,14 +1376,14 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                         )
                                         if r.get("ok"):
                                             _success_count += 1
-                                    st.success(f"✅ {_success_count}件を対応済みとして登録しました")
+                                    st.success(f"✅ 対応済みとして登録しました")
                                     #st.rerun()  # Disabled to prevent white screen
                             
                             with _bulk_col2:
                                 if st.button(
-                                    f"❌ 一括誤検知 ({_group_size}件)",
+                                    f"❌ 誤検知にする",
                                     key=f"bulk_false_{_rule_pattern[:20]}",
-                                    help=f"{_group_size}件の予兆をまとめて誤検知にします",
+                                    help=f"この予兆を誤検知にします",
                                     use_container_width=True
                                 ):
                                     _success_count = 0
@@ -1358,39 +1395,45 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                         )
                                         if r.get("ok"):
                                             _success_count += 1
-                                    st.info(f"❌ {_success_count}件を誤検知として登録しました")
+                                    st.info(f"❌ 誤検知として登録しました")
                                     #st.rerun()  # Disabled to prevent white screen
                             
                             st.markdown("---")
                             
-                            # 個別の予兆詳細（必要に応じて確認）
+                            # 個別の予兆詳細
                             for idx, _fp in enumerate(_pred_group, 1):
-                                _fid = _fp.get("forecast_id", "")
-                                _conf = float(_fp.get("confidence", 0.0))
-                                _created_raw = _fp.get("created_at", 0)
-                                _ttf_hours = _fp.get("time_to_failure_hours", 0)
+                                _fid        = _fp.get("forecast_id", "")
+                                _conf       = float(_fp.get("confidence", 0.0))
+                                _created_raw= _fp.get("created_at", 0)
+                                _ttf_hours  = _fp.get("time_to_failure_hours", 0)
                                 _failure_dt = _fp.get("predicted_failure_datetime", "")
-                                _source_msg = _fp.get("message", "")  # input_jsonから抽出したメッセージ
-                                
-                                # ★ コンポーネント名を抽出（#1の代わりに表示）
-                                _component = _extract_component(_source_msg)
-                                if _component:
-                                    _display_id = _component
+                                _source_msg = _fp.get("message", "")
+                                _fp_ifaces  = _fp.get("affected_interfaces", [])
+                                _fp_signals = int(_fp.get("signal_count", 0))
+
+                                # ★ 表示IDの決定：affected_interfaces > messageパース > fallback
+                                if _fp_ifaces:
+                                    if len(_fp_ifaces) == 1:
+                                        _display_id = _fp_ifaces[0]
+                                    else:
+                                        _display_id = f"{_fp_ifaces[0]} 他{len(_fp_ifaces)-1}個"
                                 else:
-                                    _display_id = f"#{idx}"
-                                
+                                    _component = _extract_component(_source_msg)
+                                    _display_id = _component if _component else f"#{idx}"
+
                                 # 検出時刻を人間可読化
                                 try:
                                     _created_ts = float(_created_raw)
                                     _created_readable = datetime.fromtimestamp(_created_ts).strftime("%Y-%m-%d %H:%M:%S")
                                 except (ValueError, TypeError):
                                     _created_readable = str(_created_raw)
-                                
+
                                 with st.container():
+                                    _signal_label = f" | シグナル: {_fp_signals}件" if _fp_signals else ""
                                     st.markdown(
                                         f"<div style='background:#FAFAFA;border-left:2px solid #CCC;"
                                         f"padding:6px 10px;margin:4px 0;border-radius:3px;'>"
-                                        f"<small><b>{_display_id}</b> | 検出: {_created_readable} | 信頼度: {_conf*100:.0f}%</small>",
+                                        f"<small><b>{_display_id}</b> | 検出: {_created_readable} | 信頼度: {_conf*100:.0f}%{_signal_label}</small>",
                                         unsafe_allow_html=True
                                     )
                                     if _ttf_hours > 0:
