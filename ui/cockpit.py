@@ -1363,48 +1363,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                             
                             st.markdown("---")
                             
-                            # ★ グループ代表の推奨アクションを表示（最新レコードから取得）
-                            _rep_actions = []
-                            _rep_reasons = []
-                            for _fp in _pred_group:
-                                _acts = _fp.get("recommended_actions", [])
-                                if _acts:
-                                    # high優先度があるものを優先
-                                    if any(a.get("priority") == "high" for a in _acts):
-                                        _rep_actions = _acts
-                                        _rep_reasons = _fp.get("reasons", [])
-                                        break
-                            if not _rep_actions and _pred_group:
-                                _rep_actions = _pred_group[0].get("recommended_actions", [])
-                                _rep_reasons = _pred_group[0].get("reasons", [])
-
-                            if _rep_actions:
-                                with st.expander("🛠️ 推奨アクション（AIエージェント分析）", expanded=True):
-                                    for _ai, _act in enumerate(_rep_actions, 1):
-                                        _title = _act.get("title", "")
-                                        _effect = _act.get("effect", "")
-                                        _priority = _act.get("priority", "medium")
-                                        _rationale = _act.get("rationale", "")
-                                        _steps = _act.get("steps", "")
-                                        _bg = {"high": "#FFEBEE", "medium": "#FFF3E0", "low": "#E8F5E9"}.get(_priority, "#FFF3E0")
-                                        _bc = {"high": "#D32F2F", "medium": "#FF6F00", "low": "#2E7D32"}.get(_priority, "#FF6F00")
-                                        _ic = {"high": "🔴", "medium": "🟠", "low": "🟢"}.get(_priority, "🟠")
-                                        _pl = {"high": "最優先", "medium": "推奨", "low": "補助"}.get(_priority, "推奨")
-                                        st.markdown(
-                                            f"<div style='background:{_bg};padding:8px 12px;"
-                                            f"border-left:4px solid {_bc};border-radius:4px;margin:6px 0;font-size:13px;'>"
-                                            f"<b>{_ic} {_ai}. {_title}</b>"
-                                            f"<span style='float:right;background:{_bc};color:white;"
-                                            f"padding:1px 6px;border-radius:3px;font-size:11px;'>{_pl}</span><br>"
-                                            + (f"<span style='color:#555;font-size:12px;'>💡 {_effect}</span><br>" if _effect else "")
-                                            + (f"<span style='color:#777;font-size:11px;'>📌 {_rationale}</span>" if _rationale else "")
-                                            + ("</div>"),
-                                            unsafe_allow_html=True
-                                        )
-                                        if _steps:
-                                            with st.expander(f"📋 手順（{_title[:20]}）", expanded=False):
-                                                st.code(_steps, language="text")
-
                             # 個別の予兆詳細（必要に応じて確認）
                             for idx, _fp in enumerate(_pred_group, 1):
                                 _fid = _fp.get("forecast_id", "")
