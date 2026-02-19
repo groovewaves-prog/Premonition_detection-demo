@@ -159,12 +159,12 @@ def _sanitize_prediction_context(text: str, max_len: int = 800) -> str:
     - max_len で切り詰め（プロンプト肥大化防止 → 速度改善）
     """
     import re as _re
-    # 制御文字除去
-    text = _re.sub(r'[--]', '', text or "")
+    # 制御文字除去（\x01含む全C0制御文字）
+    text = _re.sub(r'[\x00-\x1f\x7f]', '', text or "")
     # パスワード・シークレット系を遮蔽
-    text = _re.sub(r'(?i)(password|passwd|secret|token|api.?key)\s*[=:]\s*\S+', r'=***', text)
+    text = _re.sub(r'(?i)(password|passwd|secret|token|api.?key)\s*[=:]\s*\S+', r'\1=[MASKED]', text)
     # プライベートIP は最後オクテットをマスク
-    text = _re.sub(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.)\d{1,3}', r'***', text)
+    text = _re.sub(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.)\d{1,3}', r'\1***', text)
     return text[:max_len]
 
 
@@ -490,13 +490,29 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
 
         _signal_count = len(_msg_sources)
 
+        # ★ デバイスIDごとにメッセージをグループ化してから predict_api を1回だけ呼ぶ
+        # 従来: 1メッセージ × N回 → LLMに1件しか渡らず推奨アクションの精度が低かった
+        # 修正: デバイス単位で全メッセージをまとめて1回 → LLMに全文脈を渡す
+        #       forecast_ledger への重複登録も防ぐ（"optical 16件" 問題の解消）
+        _dev_msg_map: dict = {}
         for _dev_id, _msg, _src in _msg_sources:
+            if _dev_id not in _dev_msg_map:
+                _dev_msg_map[_dev_id] = {"messages": [], "src": _src}
+            _dev_msg_map[_dev_id]["messages"].append(_msg)
+            if _src == "simulation":  # simulation が混じれば simulation 優先
+                _dev_msg_map[_dev_id]["src"] = "simulation"
+
+        for _dev_id, _dev_data in _dev_msg_map.items():
+            _msgs = _dev_data["messages"]
+            _src  = _dev_data["src"]
             _resp = dt_engine.predict_api({
                 "tenant_id":       site_id,
                 "device_id":       _dev_id,
-                "msg":             _msg,
+                "msg":             _msgs[0],    # 後方互換: 先頭メッセージ
+                "messages":        _msgs,        # ★ 全メッセージをLLMに渡す
                 "timestamp":       time.time(),
                 "record_forecast": True,
+                "api_key":         api_key or "",
                 "attrs":           {
                     "source":            _src,
                     "degradation_level": _sim_level if _src == "simulation" else 1,
@@ -504,16 +520,26 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             })
             if _resp.get("ok"):
                 for _p in _resp.get("predictions", []):
-                    # ── engine の計算結果を信頼し、上書きしない ──
-                    # engine は degradation_level に応じて confidence/ttc/early を調整済み
-                    # 再帰的な children_map から affected_count も算出済み
                     _p["id"]     = _dev_id
                     _p["source"] = _src
-                    # signal_count のみ LLM プロンプト用に追加
                     _p["prediction_signal_count"] = _signal_count
 
-                    if not any(d.get("id") == _dev_id for d in dt_predictions):
+                    # デバイスごとに1エントリ（重複なし）
+                    _existing_idx = next(
+                        (i for i, d in enumerate(dt_predictions) if d.get("id") == _dev_id),
+                        None
+                    )
+                    if _existing_idx is None:
                         dt_predictions.append(_p)
+                    else:
+                        # 既存あり: 推奨アクションが強化されている場合のみ上書き
+                        _existing = dt_predictions[_existing_idx]
+                        _new_acts = _p.get("recommended_actions", [])
+                        _old_acts = _existing.get("recommended_actions", [])
+                        _new_has_high = any(a.get("priority") == "high" for a in _new_acts)
+                        _old_has_high = any(a.get("priority") == "high" for a in _old_acts)
+                        if (_new_has_high and not _old_has_high) or (len(_new_acts) > len(_old_acts)):
+                            dt_predictions[_existing_idx] = _p
 
         # ── 自動 outcome 登録 ──────────────────────────────
         # Execute 成功済みデバイス → MITIGATED（競合状態に関わらず有効）
@@ -1337,6 +1363,48 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                             
                             st.markdown("---")
                             
+                            # ★ グループ代表の推奨アクションを表示（最新レコードから取得）
+                            _rep_actions = []
+                            _rep_reasons = []
+                            for _fp in _pred_group:
+                                _acts = _fp.get("recommended_actions", [])
+                                if _acts:
+                                    # high優先度があるものを優先
+                                    if any(a.get("priority") == "high" for a in _acts):
+                                        _rep_actions = _acts
+                                        _rep_reasons = _fp.get("reasons", [])
+                                        break
+                            if not _rep_actions and _pred_group:
+                                _rep_actions = _pred_group[0].get("recommended_actions", [])
+                                _rep_reasons = _pred_group[0].get("reasons", [])
+
+                            if _rep_actions:
+                                with st.expander("🛠️ 推奨アクション（AIエージェント分析）", expanded=True):
+                                    for _ai, _act in enumerate(_rep_actions, 1):
+                                        _title = _act.get("title", "")
+                                        _effect = _act.get("effect", "")
+                                        _priority = _act.get("priority", "medium")
+                                        _rationale = _act.get("rationale", "")
+                                        _steps = _act.get("steps", "")
+                                        _bg = {"high": "#FFEBEE", "medium": "#FFF3E0", "low": "#E8F5E9"}.get(_priority, "#FFF3E0")
+                                        _bc = {"high": "#D32F2F", "medium": "#FF6F00", "low": "#2E7D32"}.get(_priority, "#FF6F00")
+                                        _ic = {"high": "🔴", "medium": "🟠", "low": "🟢"}.get(_priority, "🟠")
+                                        _pl = {"high": "最優先", "medium": "推奨", "low": "補助"}.get(_priority, "推奨")
+                                        st.markdown(
+                                            f"<div style='background:{_bg};padding:8px 12px;"
+                                            f"border-left:4px solid {_bc};border-radius:4px;margin:6px 0;font-size:13px;'>"
+                                            f"<b>{_ic} {_ai}. {_title}</b>"
+                                            f"<span style='float:right;background:{_bc};color:white;"
+                                            f"padding:1px 6px;border-radius:3px;font-size:11px;'>{_pl}</span><br>"
+                                            + (f"<span style='color:#555;font-size:12px;'>💡 {_effect}</span><br>" if _effect else "")
+                                            + (f"<span style='color:#777;font-size:11px;'>📌 {_rationale}</span>" if _rationale else "")
+                                            + ("</div>"),
+                                            unsafe_allow_html=True
+                                        )
+                                        if _steps:
+                                            with st.expander(f"📋 手順（{_title[:20]}）", expanded=False):
+                                                st.code(_steps, language="text")
+
                             # 個別の予兆詳細（必要に応じて確認）
                             for idx, _fp in enumerate(_pred_group, 1):
                                 _fid = _fp.get("forecast_id", "")
