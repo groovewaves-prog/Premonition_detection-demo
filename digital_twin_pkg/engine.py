@@ -62,8 +62,11 @@ class PredictResult:
     criticality:          str  = "standard"
     time_to_critical_min: int  = 60
     early_warning_hours:  int  = 24
-    time_to_failure_hours: int = 336  # ★ RUL: 今から完全故障まで（時間）
-    predicted_failure_datetime: str = ""  # ★ 故障発生予測日時（ISO形式）
+    time_to_failure_hours: int = 336
+    predicted_failure_datetime: str = ""
+    # ★ シグナル分析フィールド（推奨アクション選択・UI表示に使用）
+    signal_count:         int  = 0   # 注入/検出されたアラームメッセージ総数
+    affected_interfaces:  list = _field(default_factory=list)  # 影響を受けたインターフェース名リスト
 
     def to_dict(self, affected_count: int = 0, source: str = "real"):
         return {
@@ -79,6 +82,9 @@ class PredictResult:
             "early_warning_hours":  int(self.early_warning_hours),
             "time_to_failure_hours": int(self.time_to_failure_hours),
             "predicted_failure_datetime": self.predicted_failure_datetime,
+            # ★ シグナル分析（DBに保存・UI表示に使用）
+            "signal_count":         int(self.signal_count),
+            "affected_interfaces":  list(self.affected_interfaces or []),
             # ── cockpit.py 互換フィールド ──────────────────────
             "is_prediction":        True,
             "source":               source,
@@ -505,7 +511,7 @@ class DigitalTwinEngine:
             unique_components = set()
             for _, _, _m in matched_signals:
                 unique_components.update(
-                    _re_comp.findall(r'\b(?:Gi|Te|Fa|Et)\d+/\d+/\d+|\b(?:Gi|Te|Fa|Et)\d+/\d+', _m))
+                    _re_comp.findall(r'\b(?:Gi|Te|Fa|Et|Hu)\d+(?:/\d+){1,3}', _m))
             # インターフェース名が抽出できた場合はそれを、できない場合はシグナル件数を使用
             component_count = len(unique_components) if unique_components else len(matched_signals)
 
@@ -514,7 +520,7 @@ class DigitalTwinEngine:
                 affected_count=component_count,
                 base_actions=primary_rule.recommended_actions,
             )
-            
+
             pred = {
                 "id": dev_id,
                 "label": f"🔮 [予兆] {primary_rule.escalated_state}",
@@ -530,9 +536,12 @@ class DigitalTwinEngine:
                 "prediction_early_warning_hours": primary_rule.early_warning_hours,
                 "prediction_affected_count": impact_count,
                 "prediction_signal_count": len(matched_signals),
+                # ★ シグナル分析フィールド
+                "signal_count":        len(matched_signals),
+                "affected_interfaces": sorted(unique_components),
                 "prediction_confidence_factors": {"base": primary_rule.base_confidence, "match_quality": primary_quality},
-                "recommended_actions": smart_actions,  # LLMベースの動的アクション
-                "base_recommended_actions": primary_rule.recommended_actions,  # 元の固定アクション（参考用）
+                "recommended_actions": smart_actions,
+                "base_recommended_actions": primary_rule.recommended_actions,
                 "runbook_url": primary_rule.runbook_url
             }
             pid = str(uuid.uuid4())
@@ -722,7 +731,7 @@ class DigitalTwinEngine:
                 for _am in _all_messages:
                     _all_components.update(
                         _re_comp.findall(
-                            r'\b(?:Gi|Te|Fa|Et)\d+/\d+/\d+|\b(?:Gi|Te|Fa|Et)\d+/\d+', _am or ""))
+                            r'\b(?:Gi|Te|Fa|Et|Hu)\d+(?:/\d+){1,3}', _am or ""))
                 _affected_est = len(_all_components) if _all_components else len(_all_messages)
 
                 _rule_pat  = str(getattr(rule, "pattern", "unknown"))
@@ -737,6 +746,10 @@ class DigitalTwinEngine:
                     pr.recommended_actions = _smart_acts
                     logger.debug(f"[Static] smart actions applied for {device_id} "
                                  f"(pattern={_rule_pat}, affected={_affected_est})")
+
+                # ★ シグナル分析フィールドをセット（prediction_jsonに保存される）
+                pr.signal_count        = len(_all_messages)
+                pr.affected_interfaces = sorted(_all_components)
 
                 results.append(pr)
             except Exception:
@@ -1149,21 +1162,26 @@ class DigitalTwinEngine:
                 try:
                     if d.get("prediction_json"):
                         pred_data = json.loads(d["prediction_json"])
-                        d["recommended_actions"] = pred_data.get("recommended_actions", [])
-                        d["reasons"] = pred_data.get("reasons", [])
-                        d["criticality"] = pred_data.get("criticality", "standard")
-                        d["time_to_critical_min"] = pred_data.get(
+                        d["recommended_actions"]    = pred_data.get("recommended_actions", [])
+                        d["reasons"]                = pred_data.get("reasons", [])
+                        d["criticality"]            = pred_data.get("criticality", "standard")
+                        d["time_to_critical_min"]   = pred_data.get(
                             "time_to_critical_min",
                             pred_data.get("prediction_time_to_critical_min", 0))
-                        d["time_to_failure_hours"] = pred_data.get(
+                        d["time_to_failure_hours"]  = pred_data.get(
                             "time_to_failure_hours",
                             pred_data.get("prediction_time_to_failure_hours", 0))
                         d["predicted_failure_datetime"] = pred_data.get(
                             "predicted_failure_datetime",
                             pred_data.get("prediction_failure_datetime", ""))
+                        # ★ シグナル分析フィールド
+                        d["signal_count"]        = int(pred_data.get("signal_count", 0))
+                        d["affected_interfaces"] = list(pred_data.get("affected_interfaces", []))
                 except Exception:
-                    d["recommended_actions"] = []
-                    d["reasons"] = []
+                    d["recommended_actions"]  = []
+                    d["reasons"]              = []
+                    d["signal_count"]         = 0
+                    d["affected_interfaces"]  = []
                 # prediction_json は返却不要（メモリ節約）
                 d.pop("prediction_json", None)
                 result.append(d)
