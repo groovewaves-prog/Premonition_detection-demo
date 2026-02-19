@@ -355,49 +355,65 @@ class DigitalTwinEngine:
         affected_count: int,
         confidence: float,
         messages: List[str],
-        device_id: str
+        device_id: str,
+        api_key: Optional[str] = None,
     ) -> Optional[List[Dict[str, str]]]:
         """
         Gemini API を使って状況に応じた推奨アクションを動的生成
-        
+
         ⚠️ セキュリティ: データをサニタイズしてから送信
-        
+
         Args:
             rule_pattern: 検出されたルールパターン
             affected_count: 影響を受けたコンポーネント数
             confidence: 予測信頼度
             messages: アラームメッセージのリスト
             device_id: デバイスID
-        
+            api_key: 呼び出し元から渡されたAPIキー（優先）
+
         Returns:
             推奨アクションのリスト、または None（生成失敗時）
         """
         try:
-            import google.generativeai as genai
             import os
             import json
-            
+
             # ★ LLM送信の設定確認（オプトアウト可能）
             enable_llm = os.environ.get("ENABLE_LLM_RECOMMENDATIONS", "true").lower()
             if enable_llm not in ["true", "1", "yes"]:
                 logger.info("LLM recommendations disabled by configuration")
                 return None
-            
-            # API キーの取得
-            api_key = os.environ.get("GEMINI_API_KEY")
-            if not api_key:
-                logger.warning("GEMINI_API_KEY not found. Using static recommendations.")
+
+            # API キーの取得: 引数 → 環境変数 → st.secrets の順で探す
+            _api_key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+            if not _api_key:
+                try:
+                    import streamlit as _st
+                    _api_key = _st.secrets.get("GOOGLE_API_KEY", "")
+                except Exception:
+                    pass
+            if not _api_key:
+                logger.warning("GOOGLE_API_KEY not found. Using static recommendations.")
                 return None
-            
+
             # ★ データのサニタイズ（機密情報の除去）
             sanitized_device_id = self._sanitize_for_llm(device_id)
             # ★ 全メッセージをサニタイズ（最大50件まで）
             sanitized_messages = [self._sanitize_for_llm(msg) for msg in messages[:50]]
-            
-            # Gemini API の設定
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.0-flash-exp')
-            
+            # ★ api_key は絶対にプロンプトに含めない（二重チェック）
+            # _api_key 変数はここより下で使わない（API呼び出し専用）
+
+            # 新SDK (google-genai) 優先、旧SDK にフォールバック
+            try:
+                from google import genai as _genai
+                _client = _genai.Client(api_key=_api_key)
+                _use_new_sdk = True
+            except ImportError:
+                import google.generativeai as _genai_legacy
+                _genai_legacy.configure(api_key=_api_key)
+                _model_obj = _genai_legacy.GenerativeModel("gemma-3-12b-it")
+                _use_new_sdk = False
+
             # デバイスタイプの推定（一般化）
             device_type = "Network Device"
             if "ROUTER" in device_id.upper():
@@ -406,7 +422,7 @@ class DigitalTwinEngine:
                 device_type = "Switch"
             elif "FIREWALL" in device_id.upper():
                 device_type = "Firewall"
-            
+
             # ★ プロンプトの生成（全アラームメッセージを分析させる）
             prompt = f"""あなたは20年以上の経験を持つネットワーク機器の障害対応エキスパートです。
 
@@ -497,10 +513,17 @@ class DigitalTwinEngine:
 5. 個別部品交換はlow優先度
 6. stepsには\\nで改行"""
 
-            # Gemini API 呼び出し
+            # Gemini API 呼び出し（新SDK/旧SDK両対応）
             logger.info(f"Calling Gemini API for {affected_count} affected components")
-            response = model.generate_content(prompt)
-            response_text = response.text.strip()
+            if _use_new_sdk:
+                _resp = _client.models.generate_content(
+                    model="gemma-3-12b-it",
+                    contents=prompt
+                )
+                response_text = _resp.text.strip()
+            else:
+                _resp = _model_obj.generate_content(prompt)
+                response_text = _resp.text.strip()
             
             # JSON パース
             # Markdown コードブロックを除去
@@ -973,6 +996,70 @@ class DigitalTwinEngine:
                     time_to_failure_hours = _ttf_hours,
                     predicted_failure_datetime = _failure_dt_str,
                 )
+
+                # ★ LLM強化: degradation_level >= 3 で推奨アクションを文脈対応に強化
+                # all_messages が attrs にあれば全メッセージを使用（バッチモード）
+                # なければ単一メッセージから推定
+                import re as _re_comp
+
+                _deg_level   = int((attrs or {}).get("degradation_level", 1))
+                _api_key_arg = (attrs or {}).get("api_key", "")
+
+                # ★ 全メッセージを取得（attrs["all_messages"] 優先）
+                _all_messages: List[str] = (attrs or {}).get("all_messages", [])
+                if not _all_messages:
+                    _all_messages = [msg]
+
+                # affected_count: 全メッセージから抽出したコンポーネント数 OR signal数
+                _all_components: set = set()
+                for _am in _all_messages:
+                    _all_components.update(
+                        _re_comp.findall(
+                            r'\b(?:Gi|Te|Fa|Et)\d+/\d+/\d+|\b(?:Gi|Te|Fa|Et)\d+/\d+', _am or ""))
+                _affected_est = max(
+                    len(_all_components) if _all_components else 1,
+                    len(_all_messages),          # シグナル件数
+                    _deg_level * 2               # レベル係数
+                )
+
+                _rule_pat  = str(getattr(rule, "pattern", "unknown"))
+                _base_acts = list(getattr(rule, "recommended_actions", []) or [])
+
+                if _deg_level >= 3:
+                    # LLMへのリクエストを試みる（失敗でも必ず静的強化にフォールバック）
+                    _llm_actions = None
+                    try:
+                        _llm_actions = self._generate_actions_with_gemini(
+                            rule_pattern   = _rule_pat,
+                            affected_count = _affected_est,
+                            confidence     = conf,
+                            messages       = _all_messages,   # ★ 全メッセージを渡す
+                            device_id      = device_id,
+                            api_key        = _api_key_arg or None,
+                        )
+                    except Exception as _llm_err:
+                        logger.debug(f"LLM enhancement exception: {_llm_err}")
+
+                    if _llm_actions:
+                        # LLM成功: 動的アクションを採用
+                        pr.recommended_actions = _llm_actions
+                        logger.info(f"[LLM] dynamic actions applied for {device_id} "
+                                    f"(pattern={_rule_pat}, affected={_affected_est})")
+                    else:
+                        # LLM失敗/None: 必ず静的強化フォールバックを実行
+                        _static_enhanced = self._generate_smart_recommendations(
+                            rule_pattern   = _rule_pat,
+                            affected_count = _affected_est,
+                            confidence     = conf,
+                            messages       = [msg],
+                            device_id      = device_id,
+                            base_actions   = _base_acts,
+                            llm_cache      = None,
+                        )
+                        if _static_enhanced and _static_enhanced != _base_acts:
+                            pr.recommended_actions = _static_enhanced
+                            logger.debug(f"[Static] enhanced actions applied for {device_id} "
+                                         f"(pattern={_rule_pat}, affected={_affected_est})")
                 results.append(pr)
             except Exception:
                 continue
@@ -983,19 +1070,46 @@ class DigitalTwinEngine:
         """
         Cockpit / Simulator 共通エントリーポイント。
         record_forecast=True (デフォルト) のとき forecast_ledger に登録する。
+
+        ★ バッチ対応: request に "messages" (List[str]) を含めると
+           全メッセージを使ってLLM推奨アクションを生成する。
+           "msg" は後方互換性のために残す。
         """
         try:
             tenant_id = (request.get("tenant_id") or self.tenant_id or "default").strip().lower()
             device_id = str(request.get("device_id") or "").strip()
-            msg       = str(request.get("msg") or "").strip()
             ts        = self._parse_timestamp(request.get("timestamp"))
             if not device_id:
                 raise ValueError("device_id is required")
-            if not msg:
-                raise ValueError("msg is required")
+
+            # ★ "messages" (複数) を優先、なければ "msg" (単一) にフォールバック
+            messages_list: List[str] = []
+            _raw_messages = request.get("messages")
+            if isinstance(_raw_messages, list) and _raw_messages:
+                messages_list = [str(m) for m in _raw_messages if m]
+            if not messages_list:
+                _single = str(request.get("msg") or "").strip()
+                if _single:
+                    messages_list = [_single]
+            if not messages_list:
+                raise ValueError("msg or messages is required")
+
+            # 後方互換: 先頭メッセージを "msg" として扱う
+            msg = messages_list[0]
+
             attrs = request.get("attrs") or {}
             if not isinstance(attrs, dict):
                 attrs = {"raw_attrs": str(attrs)}
+
+            # ★ api_key を attrs に注入して predict() まで伝搬（LLM強化に使用）
+            _req_api_key = request.get("api_key", "")
+            if _req_api_key and "api_key" not in attrs:
+                attrs = dict(attrs)
+                attrs["api_key"] = _req_api_key
+
+            # ★ 全メッセージを attrs 経由で predict() に伝搬（LLM文脈強化用）
+            attrs = dict(attrs)
+            attrs["all_messages"] = messages_list
 
             req   = PredictRequest(tenant_id=tenant_id, device_id=device_id,
                                    msg=msg, timestamp=ts, attrs=attrs)
@@ -1004,6 +1118,8 @@ class DigitalTwinEngine:
             preds = self.predict(device_id=device_id, msg=msg, timestamp=ts,
                                  attrs=attrs, degradation_level=_level, source=_source)
 
+            # ★ forecast_ledger への登録はデバイスごとに1回だけ行う
+            # (複数メッセージでも重複登録しない)
             record_forecast = bool(request.get("record_forecast", True))
             forecast_ids: List[str] = []
             if record_forecast and preds:
@@ -1074,35 +1190,62 @@ class DigitalTwinEngine:
 
     def _forecast_record(self, req: Dict[str, Any], top_prediction: Dict[str, Any],
                          source: str = "real") -> Optional[str]:
-        """forecast_ledger に1行 INSERT（原子的）。forecast_id を返す。"""
+        """
+        forecast_ledger に UPSERT（同一 device_id + rule_pattern の open 行を更新）。
+        新規の場合は INSERT、既存 open の場合は prediction_json / confidence のみ更新。
+        forecast_id を返す。
+        """
         if not self.storage._conn:
             return None
         try:
-            forecast_id     = "f_" + uuid.uuid4().hex[:12]
-            created_at      = time.time()
             tenant_id       = str(req.get("tenant_id") or self.tenant_id)
             device_id       = str(req.get("device_id") or "")
             rule_pattern    = str(top_prediction.get("rule_pattern") or "unknown")
             predicted_state = str(top_prediction.get("predicted_state") or "unknown")
             confidence      = float(top_prediction.get("confidence") or 0.0)
             horizon_sec     = self._forecast_horizon_sec(rule_pattern)
-            event_ts        = float(req.get("timestamp") or created_at)
+            event_ts        = float(req.get("timestamp") or time.time())
             eval_deadline_ts = event_ts + horizon_sec
             input_json      = json.dumps(req, ensure_ascii=False)
             prediction_json = json.dumps(top_prediction, ensure_ascii=False)
 
             with self.storage._db_lock:
-                self.storage._conn.execute("""
-                    INSERT INTO forecast_ledger
-                    (forecast_id, created_at, tenant_id, device_id, rule_pattern, predicted_state,
-                     confidence, horizon_sec, eval_deadline_ts, source, status,
-                     outcome_type, outcome_ts, outcome_note, input_json, prediction_json)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (forecast_id, created_at, tenant_id, device_id, rule_pattern, predicted_state,
-                      confidence, horizon_sec, eval_deadline_ts, source, "open",
-                      None, None, None, input_json, prediction_json))
+                cur = self.storage._conn.cursor()
+
+                # ★ 同一 device_id + rule_pattern の open レコードを検索
+                cur.execute("""
+                    SELECT forecast_id FROM forecast_ledger
+                    WHERE device_id=? AND rule_pattern=? AND status='open'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (device_id, rule_pattern))
+                existing = cur.fetchone()
+
+                if existing:
+                    # ★ 既存 open レコードを更新（推奨アクション・信頼度を最新に）
+                    fid = existing[0]
+                    self.storage._conn.execute("""
+                        UPDATE forecast_ledger
+                        SET confidence=?, prediction_json=?, input_json=?,
+                            eval_deadline_ts=?, predicted_state=?
+                        WHERE forecast_id=?
+                    """, (confidence, prediction_json, input_json,
+                          eval_deadline_ts, predicted_state, fid))
+                else:
+                    # ★ 新規 INSERT
+                    fid = "f_" + uuid.uuid4().hex[:12]
+                    created_at = time.time()
+                    self.storage._conn.execute("""
+                        INSERT INTO forecast_ledger
+                        (forecast_id, created_at, tenant_id, device_id, rule_pattern, predicted_state,
+                         confidence, horizon_sec, eval_deadline_ts, source, status,
+                         outcome_type, outcome_ts, outcome_note, input_json, prediction_json)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (fid, created_at, tenant_id, device_id, rule_pattern, predicted_state,
+                          confidence, horizon_sec, eval_deadline_ts, source, "open",
+                          None, None, None, input_json, prediction_json))
+
                 self.storage._conn.commit()
-            return forecast_id
+            return fid
         except Exception as e:
             logger.warning(f"_forecast_record: {e}")
             return None
@@ -1291,7 +1434,10 @@ class DigitalTwinEngine:
 
     def forecast_list_open(self, device_id: Optional[str] = None,
                            limit: int = 50) -> List[Dict[str, Any]]:
-        """open 中の予兆リストを返す（UI表示用）"""
+        """open 中の予兆リストを返す（UI表示用）
+        
+        prediction_json から推奨アクションを取得して返す（最新のLLM強化済みアクション含む）。
+        """
         if not self.storage._conn:
             return []
         try:
@@ -1300,30 +1446,54 @@ class DigitalTwinEngine:
                 if device_id:
                     cur.execute("""
                         SELECT forecast_id, created_at, device_id, rule_pattern,
-                               predicted_state, confidence, eval_deadline_ts, source, input_json
+                               predicted_state, confidence, eval_deadline_ts, source,
+                               input_json, prediction_json
                         FROM forecast_ledger
                         WHERE status='open' AND device_id=?
                         ORDER BY created_at DESC LIMIT ?""", (device_id, limit))
                 else:
                     cur.execute("""
                         SELECT forecast_id, created_at, device_id, rule_pattern,
-                               predicted_state, confidence, eval_deadline_ts, source, input_json
+                               predicted_state, confidence, eval_deadline_ts, source,
+                               input_json, prediction_json
                         FROM forecast_ledger
                         WHERE status='open'
                         ORDER BY confidence DESC, created_at DESC LIMIT ?""", (limit,))
                 rows = cur.fetchall() or []
             keys = ["forecast_id","created_at","device_id","rule_pattern",
-                    "predicted_state","confidence","eval_deadline_ts","source","input_json"]
+                    "predicted_state","confidence","eval_deadline_ts","source",
+                    "input_json","prediction_json"]
             result = []
             for r in rows:
                 d = dict(zip(keys, r))
-                # input_jsonからログメッセージを抽出
+                # input_json からログメッセージを抽出
                 try:
                     if d.get("input_json"):
                         input_data = json.loads(d["input_json"])
                         d["message"] = input_data.get("msg", "")
                 except Exception:
                     d["message"] = ""
+                # ★ prediction_json から推奨アクション・根拠を抽出（最新LLM強化済み）
+                try:
+                    if d.get("prediction_json"):
+                        pred_data = json.loads(d["prediction_json"])
+                        d["recommended_actions"] = pred_data.get("recommended_actions", [])
+                        d["reasons"] = pred_data.get("reasons", [])
+                        d["criticality"] = pred_data.get("criticality", "standard")
+                        d["time_to_critical_min"] = pred_data.get(
+                            "time_to_critical_min",
+                            pred_data.get("prediction_time_to_critical_min", 0))
+                        d["time_to_failure_hours"] = pred_data.get(
+                            "time_to_failure_hours",
+                            pred_data.get("prediction_time_to_failure_hours", 0))
+                        d["predicted_failure_datetime"] = pred_data.get(
+                            "predicted_failure_datetime",
+                            pred_data.get("prediction_failure_datetime", ""))
+                except Exception:
+                    d["recommended_actions"] = []
+                    d["reasons"] = []
+                # prediction_json は返却不要（メモリ節約）
+                d.pop("prediction_json", None)
                 result.append(d)
             return result
         except Exception:
