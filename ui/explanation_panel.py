@@ -178,13 +178,34 @@ _OUTCOME_BADGES = {
 
 
 def _render_similar_incidents(dt_engine: Any, alarm_text: str) -> None:
-    """ChromaDB で類似インシデントを検索して表示する。"""
+    """ChromaDB で類似インシデントを検索して表示する。結果をキャッシュして高速化。"""
     try:
         vs = getattr(dt_engine, "vector_store", None)
         if vs is None:
             return
-        results = vs.search_similar_alarms(alarm_text=alarm_text, n_results=5)
+        
+        # ★ 高速化: 同一アラームテキストの検索結果をキャッシュ
+        import hashlib
+        _cache_key = f"similar_{hashlib.md5(alarm_text[:200].encode()).hexdigest()}"
+        
+        # Streamlit session_state にキャッシュ（有効期限60秒）
+        import streamlit as _st
+        _cache = _st.session_state.get("_similar_cache", {})
+        _cached = _cache.get(_cache_key)
+        if _cached and (time.time() - _cached["ts"]) < 60:
+            results = _cached["results"]
+        else:
+            results = vs.search_similar_alarms(alarm_text=alarm_text, n_results=5)
+            _cache[_cache_key] = {"ts": time.time(), "results": results}
+            # キャッシュサイズ制限
+            if len(_cache) > 20:
+                _oldest = sorted(_cache.items(), key=lambda x: x[1]["ts"])[:10]
+                for k, _ in _oldest:
+                    _cache.pop(k, None)
+            _st.session_state["_similar_cache"] = _cache
+        
         if not results:
+            return
             return
 
         with st.expander(
