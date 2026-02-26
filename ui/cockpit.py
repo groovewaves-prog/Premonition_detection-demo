@@ -483,10 +483,26 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 _grouped[_dev_id] = ([], _src)
             _grouped[_dev_id][0].append(_msg)
 
+        # ★ 高速化: cockpit レベルの予測キャッシュ
+        #   同一メッセージ＋レベルの場合は predict_api をスキップ
+        _ck_pred_cache = "dt_prediction_cache"
+        if _ck_pred_cache not in st.session_state:
+            st.session_state[_ck_pred_cache] = {}
+
         for _dev_id, (_msgs_list, _src) in _grouped.items():
             try:
-                # 全メッセージを連結して1回の predict_api で処理
                 _combined_msg = "\n".join(_msgs_list)
+                _cache_key = f"{_dev_id}|{_sim_level}|{hash(_combined_msg[:200])}"
+
+                # キャッシュチェック
+                _cached = st.session_state[_ck_pred_cache].get(_cache_key)
+                if _cached is not None:
+                    # キャッシュヒット → predict_api をスキップ
+                    for _p in _cached:
+                        if not any(d.get("id") == _dev_id for d in dt_predictions):
+                            dt_predictions.append(_p)
+                    continue
+
                 _resp = dt_engine.predict_api({
                     "tenant_id":       site_id,
                     "device_id":       _dev_id,
@@ -500,13 +516,24 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     }
                 })
                 if _resp.get("ok"):
+                    _preds_to_cache = []
                     for _p in _resp.get("predictions", []):
                         _p["id"]     = _dev_id
                         _p["source"] = _src
                         _p["prediction_signal_count"] = _signal_count
+                        _preds_to_cache.append(_p)
 
                         if not any(d.get("id") == _dev_id for d in dt_predictions):
                             dt_predictions.append(_p)
+
+                    # キャッシュに保存（同一スライダー位置での再描画を高速化）
+                    st.session_state[_ck_pred_cache][_cache_key] = _preds_to_cache
+                    # キャッシュサイズ制限
+                    if len(st.session_state[_ck_pred_cache]) > 20:
+                        _keys = list(st.session_state[_ck_pred_cache].keys())
+                        for _old_k in _keys[:10]:
+                            st.session_state[_ck_pred_cache].pop(_old_k, None)
+
             except Exception as _pred_err:
                 logger.warning(f"predict_api failed for {_dev_id}: {_pred_err}")
 
