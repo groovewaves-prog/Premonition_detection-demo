@@ -166,12 +166,13 @@ def _render_weak_signal_injection():
         
         # --- リアルなログメッセージ生成 (ここが重要) ---
         # ============================================================
-        # ★ 改善: シミュレーションのリアリティ向上
-        # - レベルに応じてランダムにコンポーネントを選択
-        # - 低レベル: 少数のコンポーネント、断続的
-        # - 高レベル: 多数のコンポーネント、連続的
+        # ★ 改善: シード固定で同一レベルは同一メッセージを生成
+        #   → predict キャッシュが有効になり、スライダー操作が高速化
+        #   → デバイス＋シナリオが変わればシードも変わるので多様性は維持
         # ============================================================
-        import random
+        import random as _rng
+        _seed = hash(f"{target_device}_{scenario_type}_{degradation_level}")
+        _rng_local = _rng.Random(_seed)
         
         log_messages = []
         if degradation_level > 0:
@@ -183,56 +184,33 @@ def _render_weak_signal_injection():
                 ]
                 
                 # レベルに応じて影響を受けるインターフェース数を決定
-                if degradation_level == 1:
-                    num_affected = 1  # 1個のみ
-                elif degradation_level == 2:
-                    num_affected = 2  # 2個
-                elif degradation_level == 3:
-                    num_affected = 3  # 3個
-                elif degradation_level == 4:
-                    num_affected = 4  # 4個
-                else:  # Level 5
-                    num_affected = 6  # 多数
+                num_affected = min(degradation_level + (1 if degradation_level >= 5 else 0), len(optical_interfaces))
                 
-                # ランダムに選択（ただし毎回同じにならないように）
-                selected_interfaces = random.sample(optical_interfaces, min(num_affected, len(optical_interfaces)))
+                # ★ シード固定ランダム: 同一条件で同一結果
+                selected_interfaces = _rng_local.sample(optical_interfaces, num_affected)
                 
                 dbm = -23.0 - (degradation_level * 0.4)
                 
                 for i, intf in enumerate(selected_interfaces):
                     # レベルに応じて異なるメッセージパターン
                     if i == 0 or degradation_level >= 3:
-                        # Level1: optical/rx power/dbm ヒット
                         _msg = (f"%TRANSCEIVER-4-THRESHOLD_VIOLATION: Rx Power {dbm:.1f} dBm on {intf} "
                                f"(optical signal degrading). transceiver rx power below threshold.")
                         log_messages.append(_msg)
                     
                     if (i == 1 or degradation_level >= 4) and len(log_messages) < degradation_level:
-                        # Level2: optical signal / light level ヒット
                         _msg = (f"%OPTICAL-3-SIGNAL_WARN: optical signal level degrading on {intf}. "
                                f"light level {dbm+1.5:.1f} dBm. transceiver rx power loss detected.")
                         log_messages.append(_msg)
 
             elif "Microburst" in scenario_type:
-                # ★ 利用可能なデータインターフェース
                 data_interfaces = [
                     "Gi0/1/0", "Gi0/1/1", "Gi0/1/2", "Gi0/1/3",
                     "Gi0/1/4", "Gi0/1/5", "Gi0/1/6", "Gi0/1/7"
                 ]
                 
-                # レベルに応じて影響を受けるインターフェース数を決定
-                if degradation_level == 1:
-                    num_affected = 1
-                elif degradation_level == 2:
-                    num_affected = 2
-                elif degradation_level == 3:
-                    num_affected = 3
-                elif degradation_level == 4:
-                    num_affected = 4
-                else:  # Level 5
-                    num_affected = 5
-                
-                selected_interfaces = random.sample(data_interfaces, min(num_affected, len(data_interfaces)))
+                num_affected = min(degradation_level + (0 if degradation_level < 5 else 1), len(data_interfaces))
+                selected_interfaces = _rng_local.sample(data_interfaces, num_affected)
                 
                 drops = degradation_level * 200
                 
@@ -248,7 +226,6 @@ def _render_weak_signal_injection():
                         log_messages.append(_msg)
 
             elif "Route" in scenario_type:
-                # ★ BGP peer pool
                 bgp_peers = [
                     ("10.1.1.1", "AS65001"),
                     ("10.1.1.2", "AS65002"),
@@ -257,9 +234,8 @@ def _render_weak_signal_injection():
                     ("10.2.1.1", "AS65010"),
                 ]
                 
-                # レベルに応じて影響を受けるピア数を決定
                 num_affected = min(degradation_level, len(bgp_peers))
-                selected_peers = random.sample(bgp_peers, num_affected)
+                selected_peers = _rng_local.sample(bgp_peers, num_affected)
                 
                 updates = degradation_level * 500
                 
