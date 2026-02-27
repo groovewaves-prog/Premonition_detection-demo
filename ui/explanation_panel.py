@@ -25,7 +25,7 @@ ANOMALY_TYPE_LABELS = {
 }
 
 _SCORE_LABELS = {
-    "semantic":      "意味的深刻度",
+    "semantic":      "ログ内容の深刻度",
     "trend":         "劣化速度",
     "volatility":    "不安定さ",
     "history":       "発生頻度",
