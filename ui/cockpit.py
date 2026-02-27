@@ -1304,6 +1304,13 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         # グループ統計情報
                         _confidences = [float(p.get("confidence", 0.0)) for p in _pred_group]
                         _avg_conf = sum(_confidences) / len(_confidences) if _confidences else 0.0
+                        _max_conf = max(_confidences) if _confidences else 0.0
+                        
+                        # ★ simulation かどうかを判定（sourceフィールドで識別）
+                        _is_sim = any(p.get("source") == "simulation" for p in _pred_group)
+                        # simulation の場合は最新（=最高）の確信度を表示、real の場合は平均
+                        _display_conf = _max_conf if _is_sim else _avg_conf
+                        _conf_label = "確信度" if _is_sim else "平均信頼度"
                         
                         # 最古と最新の検出時刻（Unix timestamp → 人間可読）
                         _timestamps = []
@@ -1336,7 +1343,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         
                         # グループヘッダー（折りたたみ可能）
                         with st.expander(
-                            f"🔖 {_rule_pattern}  ({_group_size}件 | 平均信頼度: {_avg_conf*100:.0f}% | 最新: {_relative})",
+                            f"🔖 {_rule_pattern}  ({_group_size}件 | {_conf_label}: {_display_conf*100:.0f}% | 最新: {_relative})",
                             expanded=(_group_size <= 3)  # 3件以下は自動展開
                         ):
                             st.markdown(
