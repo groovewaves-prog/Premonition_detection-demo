@@ -1418,8 +1418,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                         {_sample_logs}
                                         """
                                         
-                                        # LLMによる動的命名の実行
-                                        genai.configure(api_key=api_key)
+                                        # LLMによる動的命名の実行（エラーの元だったimport文は除去済み）
                                         _model = genai.GenerativeModel('gemini-1.5-flash')
                                         _response = _model.generate_content(_prompt)
                                         
@@ -1428,7 +1427,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                         if _learned_title:
                                             # 余計な改行や記号をサニタイズ
                                             _learned_title = _learned_title.replace('\n', ' ').replace('"', '').replace("'", "")[:30]
-                                            # ★ ここがキモ: AIが考えたタイトルを学習済み辞書に「自動登録」する
+                                            # ★ AIが考えたタイトルを学習済み辞書に「自動登録」する
                                             st.session_state.auto_learned_rules[_pattern_key] = _learned_title
                                             _incident_name = _learned_title
                                         else:
@@ -1444,6 +1443,88 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
 
                         # 統計情報と、実際のシグナル件数の計算
                         _confidences = [float(p.get("confidence", 0.0)) for p in _pred_group]
+                        _is_sim = any(p.get("source") == "simulation" for p in _pred_group)
+                        _display_conf = max(_confidences) if _is_sim else (sum(_confidences) / len(_confidences) if _confidences else 0.0)
+                        
+                        # ★ 修正: バッチ化されたログの「実際の行数」を正確にカウントする
+                        _total_signals = 0
+                        for p in _pred_group:
+                            _raw_msg = p.get("message", "")
+                            _total_signals += len([line for line in _raw_msg.split('\n') if line.strip()])
+                        _total_signals = _total_signals or 1
+                        
+                        _timestamps = []
+                        for p in _pred_group:
+                            try:
+                                _timestamps.append(float(p.get("created_at", 0)))
+                            except:
+                                pass
+                        
+                        if _timestamps:
+                            _newest_ts = max(_timestamps)
+                            _elapsed_sec = time.time() - _newest_ts
+                            if _elapsed_sec < 3600:
+                                _relative = f"{int(_elapsed_sec / 60)}分前"
+                            elif _elapsed_sec < 86400:
+                                _relative = f"{int(_elapsed_sec / 3600)}時間前"
+                            else:
+                                _relative = f"{int(_elapsed_sec / 86400)}日前"
+                        else:
+                            _relative = "不明"
+
+                        # ── インシデントカード（証拠リスト型）の描画 ──
+                        with st.container(border=True):
+                            st.markdown(
+                                f"<div style='margin-bottom: 12px;'>"
+                                f"<span style='font-size: 1.1em; font-weight: bold; color: #D32F2F;'>🚨 インシデント：{_incident_name}</span><br>"
+                                f"<span style='color: #666; font-size: 0.9em;'>信頼度: <b>{_display_conf*100:.0f}%</b> ｜ 最新検知: {_relative} ｜ 影響シグナル: <b>{_total_signals}件</b></span>"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
+                            
+                            # 証拠シグナルのリスト表示（ログを改行で分割し、1行ずつ独立して描画）
+                            with st.expander(f"🔍 証拠シグナル一覧（検知ログ詳細）", expanded=True):
+                                for _fp in _pred_group:
+                                    try:
+                                        _created_ts = float(_fp.get("created_at", 0))
+                                        _dt_str = datetime.fromtimestamp(_created_ts).strftime("%m/%d %H:%M:%S")
+                                    except:
+                                        _dt_str = "不明"
+                                    
+                                    _raw_msg = _fp.get("message", "ログ内容なし")
+                                    # 改行コードで分割し、空行を除外
+                                    _log_lines = [line.strip() for line in _raw_msg.split('\n') if line.strip()]
+                                    
+                                    for _line in _log_lines:
+                                        st.markdown(
+                                            f"<div style='font-family: monospace; font-size: 0.85em; background: #F8F9FA; padding: 4px 8px; margin-bottom: 4px; border-left: 3px solid #FFC107; word-break: break-all;'>"
+                                            f"<span style='color: #888;'>[{_dt_str}]</span> {_line}"
+                                            f"</div>",
+                                            unsafe_allow_html=True
+                                        )
+
+                            # インシデント単位でのアクションボタン
+                            st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
+                            _btn_col1, _btn_col2 = st.columns(2)
+                            with _btn_col1:
+                                if st.button(f"✅ このインシデントを対応済みにする", key=f"bulk_handled_{_rule_pattern}", use_container_width=True):
+                                    _cnt = 0
+                                    for p in _pred_group:
+                                        r = dt_engine.forecast_register_outcome(p.get("forecast_id", ""), "mitigated", note="インシデント単位で対応済み")
+                                        if r.get("ok"): _cnt += 1
+                                    st.success(f"✅ {_cnt}件のシグナルを対応済みとしてクローズしました")
+                                    time.sleep(1)
+                                    st.rerun()
+                            
+                            with _btn_col2:
+                                if st.button(f"❌ 誤検知として学習させる", key=f"bulk_false_{_rule_pattern}", use_container_width=True):
+                                    _cnt = 0
+                                    for p in _pred_group:
+                                        r = dt_engine.forecast_register_outcome(p.get("forecast_id", ""), "false_alarm", note="インシデント単位で誤検知学習")
+                                        if r.get("ok"): _cnt += 1
+                                    st.info(f"❌ {_cnt}件のシグナルを誤検知としてAIに学習させました")
+                                    time.sleep(1)
+                                    st.rerun()
                         
         else:
             # prob <= 0.6 or no candidate
