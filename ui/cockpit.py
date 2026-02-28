@@ -1380,96 +1380,72 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     for _rule_pattern, _pred_group in grouped_preds.items():
                         _group_size = len(_pred_group)
                         
-                        # ★ 賢いタイトル生成: レベル(件数)に応じて真因タイトルを動的に変更
+                        # =========================================================
+                        # ★ 進化版: LLMによるインシデントタイトルの自動学習＆自動登録機能
+                        # =========================================================
                         _incident_name = selected_incident_candidate.get('predicted_state') or selected_incident_candidate.get('label', '').replace('🔮 [予兆] ', '')
+                        
                         if not _incident_name or _incident_name == '不明':
-                            if _group_size <= 2:
-                                _name_map = {
-                                    "optical": "光モジュール(SFP)単体劣化の疑い",
-                                    "microburst": "特定ポートのトラフィックバースト/バッファ溢れ",
-                                    "route_instability": "特定BGPピアの経路不安定"
-                                }
-                            else:
-                                _name_map = {
-                                    "optical": "共通ハードウェア/基板モジュール劣化の疑い",
-                                    "microburst": "ファブリック輻輳/内部共有バッファ枯渇の疑い",
-                                    "route_instability": "ルーターCPU高負荷/ルーティングプロセス異常の疑い"
-                                }
-                            _incident_name = _name_map.get(_rule_pattern, f"異常シグナル検知 ({_rule_pattern})")
-
-                        # 統計情報の計算
-                        _confidences = [float(p.get("confidence", 0.0)) for p in _pred_group]
-                        _is_sim = any(p.get("source") == "simulation" for p in _pred_group)
-                        _display_conf = max(_confidences) if _is_sim else (sum(_confidences) / len(_confidences) if _confidences else 0.0)
-                        
-                        _timestamps = []
-                        for p in _pred_group:
-                            try:
-                                _timestamps.append(float(p.get("created_at", 0)))
-                            except:
-                                pass
-                        
-                        if _timestamps:
-                            _newest_ts = max(_timestamps)
-                            _elapsed_sec = time.time() - _newest_ts
-                            if _elapsed_sec < 3600:
-                                _relative = f"{int(_elapsed_sec / 60)}分前"
-                            elif _elapsed_sec < 86400:
-                                _relative = f"{int(_elapsed_sec / 3600)}時間前"
-                            else:
-                                _relative = f"{int(_elapsed_sec / 86400)}日前"
-                        else:
-                            _relative = "不明"
-
-                        # ── インシデントカード（証拠リスト型）の描画 ──
-                        with st.container(border=True):
-                            st.markdown(
-                                f"<div style='margin-bottom: 12px;'>"
-                                f"<span style='font-size: 1.1em; font-weight: bold; color: #D32F2F;'>🚨 インシデント：{_incident_name}</span><br>"
-                                f"<span style='color: #666; font-size: 0.9em;'>信頼度: <b>{_display_conf*100:.0f}%</b> ｜ 最新検知: {_relative} ｜ 影響シグナル: <b>{_group_size}件</b></span>"
-                                f"</div>",
-                                unsafe_allow_html=True
-                            )
+                            # 1. 自動学習ルールのキャッシュ（辞書）を初期化
+                            if "auto_learned_rules" not in st.session_state:
+                                st.session_state.auto_learned_rules = {}
                             
-                            # 証拠シグナルのリスト表示（全ポートの生ログを展開）
-                            with st.expander(f"🔍 証拠シグナル一覧（検知ログ詳細）", expanded=True):
-                                for _fp in _pred_group:
+                            # 2. ログの種類と「規模感（単発か複数か）」でパターンキーを作成
+                            _severity_level = "high" if _group_size > 2 else "low"
+                            _pattern_key = f"{_rule_pattern}_{_severity_level}"
+                            
+                            # 3. 学習済みルール辞書に存在するかチェック
+                            if _pattern_key in st.session_state.auto_learned_rules:
+                                # 【学習済み】キャッシュから一瞬でタイトルを取得（ルールベースと同等の爆速表示）
+                                _incident_name = st.session_state.auto_learned_rules[_pattern_key]
+                            else:
+                                # 【未学習】未知のパターンの場合、LLMに推論させて新ルールを自動登録する
+                                if api_key and GENAI_AVAILABLE:
                                     try:
-                                        _created_ts = float(_fp.get("created_at", 0))
-                                        _dt_str = datetime.fromtimestamp(_created_ts).strftime("%m/%d %H:%M:%S")
-                                    except:
-                                        _dt_str = "不明"
-                                    _msg = _fp.get("message", "ログ内容なし")
-                                    st.markdown(
-                                        f"<div style='font-family: monospace; font-size: 0.85em; background: #F8F9FA; padding: 4px 8px; margin-bottom: 4px; border-left: 3px solid #FFC107;'>"
-                                        f"<span style='color: #888;'>[{_dt_str}]</span> {_msg}"
-                                        f"</div>",
-                                        unsafe_allow_html=True
-                                    )
+                                        # 解析用のサンプルログを抽出（最大3件の生ログをLLMに読ませる）
+                                        _sample_logs = "\n".join([p.get("message", "") for p in _pred_group[:3]])
+                                        
+                                        _prompt = f"""
+                                        あなたは熟練のネットワークAIOpsエンジニアです。
+                                        以下のCisco/Juniperのシステムログ（現在 {_group_size}件 同時発生中）から、根本的な原因となる「インシデントタイトル」を命名してください。
+                                        
+                                        【条件】
+                                        ・20文字以内の簡潔な日本語で出力すること。
+                                        ・「〇〇の疑い」「〇〇の異常」などの表現を含めること。
+                                        ・ログが複数（3件以上）発生している場合は、単体故障ではなく「共通基板」「電源」「ファブリック」などの上位レイヤーの異常を疑うこと。
+                                        
+                                        【対象ログサンプル】
+                                        {_sample_logs}
+                                        """
+                                        
+                                        # LLMによる動的命名の実行
+                                        import google.generativeai as genai
+                                        genai.configure(api_key=api_key)
+                                        _model = genai.GenerativeModel('gemini-1.5-flash')
+                                        _response = _model.generate_content(_prompt)
+                                        
+                                        _learned_title = _response.text.strip()
+                                        
+                                        if _learned_title:
+                                            # 余計な改行や記号をサニタイズ
+                                            _learned_title = _learned_title.replace('\n', ' ').replace('"', '').replace("'", "")[:30]
+                                            # ★ ここがキモ: AIが考えたタイトルを学習済み辞書に「自動登録」する
+                                            st.session_state.auto_learned_rules[_pattern_key] = _learned_title
+                                            _incident_name = _learned_title
+                                        else:
+                                            _incident_name = f"異常シグナル検知 ({_rule_pattern})"
+                                            
+                                    except Exception as e:
+                                        import logging
+                                        logging.warning(f"Auto-Rule generation failed: {e}")
+                                        _incident_name = f"異常シグナル検知 ({_rule_pattern})"
+                                else:
+                                    _incident_name = f"異常シグナル検知 ({_rule_pattern})"
+                        # =========================================================
 
-                            # インシデント単位でのアクションボタン
-                            st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
-                            _btn_col1, _btn_col2 = st.columns(2)
-                            with _btn_col1:
-                                if st.button(f"✅ このインシデントを対応済みにする", key=f"bulk_handled_{_rule_pattern}", use_container_width=True):
-                                    _cnt = 0
-                                    for p in _pred_group:
-                                        r = dt_engine.forecast_register_outcome(p.get("forecast_id", ""), "mitigated", note="インシデント単位で対応済み")
-                                        if r.get("ok"): _cnt += 1
-                                    st.success(f"✅ {_cnt}件のシグナルを対応済みとしてクローズしました")
-                                    time.sleep(1)
-                                    st.rerun()
-                            
-                            with _btn_col2:
-                                if st.button(f"❌ 誤検知として学習させる", key=f"bulk_false_{_rule_pattern}", use_container_width=True):
-                                    _cnt = 0
-                                    for p in _pred_group:
-                                        r = dt_engine.forecast_register_outcome(p.get("forecast_id", ""), "false_alarm", note="インシデント単位で誤検知学習")
-                                        if r.get("ok"): _cnt += 1
-                                    st.info(f"❌ {_cnt}件のシグナルを誤検知としてAIに学習させました")
-                                    time.sleep(1)
-                                    st.rerun()
-
+                        # 統計情報と、実際のシグナル件数の計算
+                        _confidences = [float(p.get("confidence", 0.0)) for p in _pred_group]
+                        
         else:
             # prob <= 0.6 or no candidate
             if selected_incident_candidate:
