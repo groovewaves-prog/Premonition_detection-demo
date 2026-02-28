@@ -1419,7 +1419,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                         """
                                         
                                         # LLMによる動的命名の実行
-                                        import google.generativeai as genai
                                         genai.configure(api_key=api_key)
                                         _model = genai.GenerativeModel('gemini-1.5-flash')
                                         _response = _model.generate_content(_prompt)
