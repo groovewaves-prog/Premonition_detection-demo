@@ -6,7 +6,6 @@ import pandas as pd
 import sqlite3
 import os
 
-
 # ==========================================
 # ★ 追加: Streamlitグローバルキャッシュによるエンジンの保持
 # ==========================================
@@ -27,7 +26,12 @@ def _get_cached_engine(site_id: str):
         if parent_id:
             children_map.setdefault(parent_id, []).append(node_id)
             
-    engine = DigitalTwinEngine(site_id, paths.data_dir, topology, children_map)
+    # ★ 修正: 古い paths.data_dir を削除し、最新の引数仕様（キーワード引数）に合わせる
+    engine = DigitalTwinEngine(
+        topology=topology,
+        children_map=children_map,
+        tenant_id=site_id
+    )
     return engine
 
 
