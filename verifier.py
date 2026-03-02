@@ -74,6 +74,9 @@ class _PatternCache:
                 r'(?:(err-disabled|notconnect))',
                 re.I
             )
+            # 【追加】show ip interface brief 用の簡略表記パターン
+            self.if_brief_up = re.compile(r'\bup\s+up\b', re.I)
+            self.if_brief_down = re.compile(r'\bdown\s+down\b', re.I)
             
             # ハードウェア
             self.hw_check = re.compile(
@@ -276,8 +279,9 @@ def _fast_verify_interface(
     
     検証パターン:
     1. Admin down（意図的なダウン）
-    2. Line protocol up/down
-    3. Interface up/down
+    2. show ip interface brief 形式 (up up / down down)
+    3. Line protocol up/down
+    4. Interface up/down
     """
     logger.debug("Verifying interface status")
     
@@ -289,6 +293,33 @@ def _fast_verify_interface(
             "interface_evidence": "Admin down (intentional)"
         })
         logger.debug("Interface INFO: Admin down detected")
+        return
+
+    # =========================================================
+    # 【追加】show ip interface brief 形式 (up up / down down) の高速検知
+    # =========================================================
+    if cache.if_brief_down.search(text):
+        result.update({
+            "interface_status": "CRITICAL",
+            "interface_confidence": 0.9,
+            "interface_evidence": "Link DOWN (show ip interface brief)"
+        })
+        logger.debug("Interface CRITICAL: 'down down' detected")
+        return
+        
+    if cache.if_brief_up.search(text):
+        result.update({
+            "interface_status": "OK",
+            "interface_confidence": 0.9,
+            "interface_evidence": "Link UP (show ip interface brief)"
+        })
+        logger.debug("Interface OK: 'up up' detected")
+        return
+    # =========================================================
+    
+    # 従来のインターフェース状態の検出 (show interfaces等)
+    status_match = cache.if_status.findall(text)
+    if not status_match:
         return
     
     # インターフェース状態の検出
