@@ -256,16 +256,18 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
             
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     
-    # 2. 状態の判定
+    # 2. 状態の判定（★修正: 厳密な整数キャストでレベル0の誤爆を防止）
     injected = st.session_state.get("injected_weak_signal")
-    level = injected.get("level", 0) if injected else 0
+    try:
+        level = int(injected.get("level", 0)) if injected else 0
+    except:
+        level = 0
     pred_scenario = injected.get("scenario", "") if injected else ""
 
     # ==========================================
     # アプローチ2: LLMによる動的シミュレーション (主軸)
     # ==========================================
     if use_llm and GENAI_AVAILABLE:
-        # キャッシュキーにレベルを含め、状態ごとの生ログを保持
         _diag_cache_key = f"diag_{device_id}_{scenario}_{pred_scenario}_{level}"
         if "diag_cache" not in st.session_state:
             st.session_state.diag_cache = {}
@@ -282,7 +284,7 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
             if scenario != "正常稼働":
                 state_desc = f"現在、ネットワーク全体で「{scenario}」という障害が発生しています。"
             elif level == 0:
-                state_desc = "ネットワークは完全に正常稼働しています。"
+                state_desc = "ネットワークは完全に正常稼働（アラームなし、ロス0%、ハードウェア異常なし）しています。"
             elif level == 5:
                 state_desc = f"「{pred_scenario}」の深刻な劣化（レベル5/5）が起きています。"
             else:
@@ -295,16 +297,16 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
             
             【必須で含めるコマンドと出力要件（※ログ監視パーサーが読み取るため絶対遵守）】
             1. `{device_id}# ping 8.8.8.8 repeat 5`
-               - レベル0や正常時はパケットロス0% (!!!!!)。障害時やレベル5ならロスを表現 (..!!!等)。
+               - 正常時はパケットロス0% (!!!!!) と `100 percent` を出力。異常時はロスを表現 (..!!!等)。
             2. `{device_id}# show ip interface brief` 
-               - インターフェース名と状態を必ず出力すること。
-               - 正常時は必ず `GigabitEthernet0/0/0   10.1.1.1   YES NVRAM  up    up` のように「up」を含めること。
+               - 正常時（レベル0含む）は必ず `up up` という連続した文字列（間にスペース1つ）を含めること（例: `GigabitEthernet0/0/0  10.1.1.1  YES NVRAM  up up`）。
+               - 異常時（ダウン時）は `down down` という連続した文字列を含めること。
             3. `{device_id}# show environment` (または show chassis hardware)
-               - Temp(温度), Fan(ファン), Power(電源) のステータスを必ず出力すること。
-               - 正常時は必ず `NORMAL` または `OK` というキーワードを含めること（例: `Fan 1: NORMAL`）。
+               - 正常時（レベル0含む）は必ず `NORMAL` または `OK` というキーワードのみを含めること（例: `Fan 1: NORMAL`）。
                - 異常がある場合は `WARNING` や `FAIL` を含めること。
             4. 劣化原因（{pred_scenario}）または障害に直結する詳細確認コマンド
-               - 光減衰なら `show interfaces transceiver detail` 等。レベルに応じた数値をリアルに出力する。
+               - 例: 光減衰なら `show interfaces transceiver detail` 等。レベルに応じた数値をリアルに出力する。
+               - レベル0（正常時）の場合は、すべての数値が完全に正常であることを示し、WARNING等の警告文は一切出さないこと。
             
             【出力ルール】
             ・コードフェンス(```)は絶対に使わず、ターミナルに表示されるテキストそのままを出力すること。
@@ -315,6 +317,7 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
             api_key = cfg.get("google_key")
             
             if api_key:
+                import google.generativeai as genai
                 client = genai.Client(api_key=api_key)
                 response = client.models.generate_content(
                     model='gemini-1.5-flash',
@@ -355,7 +358,7 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
         lines += [
             f"{_p} show system alarms", "No active alarms", 
             f"{_p} ping 8.8.8.8 repeat 5", "Success rate is 100 percent (5/5)", 
-            f"{_p} show ip interface brief", "GigabitEthernet0/0/0 up up",
+            f"{_p} show ip interface brief", "GigabitEthernet0/0/0 10.1.1.254 YES NVRAM up up",
             f"{_p} show environment", "Fan: NORMAL, Temp: NORMAL, Power: NORMAL"
         ]
         return {"status": "SUCCESS", "sanitized_log": "\n".join(lines), "device_id": device_id}
@@ -363,7 +366,7 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
     if scenario != "正常稼働":
         if "WAN" in scenario:
             lines += [
-                f"{_p} show ip interface brief", "GigabitEthernet0/0 down down", 
+                f"{_p} show ip interface brief", "GigabitEthernet0/0/0 10.1.1.254 YES NVRAM down down", 
                 f"{_p} show ip bgp summary", "Neighbor 203.0.113.2 Idle", 
                 f"{_p} ping 203.0.113.2 repeat 5", "Success rate is 0 percent (0/5)",
                 f"{_p} show environment", "Fan: NORMAL, Temp: NORMAL, Power: NORMAL"
@@ -371,14 +374,14 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
         elif "FW" in scenario:
             lines += [
                 f"{_p} ping 8.8.8.8 repeat 5", "Success rate is 100 percent (5/5)", 
-                f"{_p} show ip interface brief", "GigabitEthernet0/0/0 up up",
+                f"{_p} show ip interface brief", "GigabitEthernet0/0/0 10.1.1.254 YES NVRAM up up",
                 f"{_p} show chassis cluster status", "Redundancy group 0: degraded", "control link: down", "fabric link: up",
                 f"{_p} show environment", "Fan: NORMAL, Temp: NORMAL, Power: WARNING"
             ]
         else:
             lines += [
                 f"{_p} ping 8.8.8.8 repeat 5", "Success rate is 100 percent (5/5)", 
-                f"{_p} show ip interface brief", "GigabitEthernet0/0/0 down down",
+                f"{_p} show ip interface brief", "GigabitEthernet0/0/0 10.1.1.254 YES NVRAM down down",
                 f"{_p} show environment", "Fan: FAIL, Temperature: HIGH, Power: NORMAL"
             ]
     else:
@@ -390,8 +393,8 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
             "!!!!!",
             "Success rate is 100 percent (5/5), round-trip min/avg/max = 1/2/4 ms",
             f"{_p} show ip interface brief",
-            "Interface              IP-Address      OK? Method Status                Protocol",
-            "GigabitEthernet0/0/0   10.1.1.254      YES NVRAM  up                    up      ",
+            "Interface              IP-Address      OK? Method Status    Protocol",
+            "GigabitEthernet0/0/0   10.1.1.254      YES NVRAM  up up             ",
             f"{_p} show environment",
             "Fan 1: NORMAL, Fan 2: NORMAL",
             "Temp: 35C (NORMAL)",
