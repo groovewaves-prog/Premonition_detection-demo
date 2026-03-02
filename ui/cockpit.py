@@ -579,6 +579,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 if _cached is not None:
                     # キャッシュヒット → predict_api をスキップ
                     for _p in _cached:
+                        _p["is_prediction"] = True
                         if not any(d.get("id") == _dev_id for d in dt_predictions):
                             dt_predictions.append(_p)
                     continue
@@ -601,6 +602,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         _p["id"]     = _dev_id
                         _p["source"] = _src
                         _p["prediction_signal_count"] = _signal_count
+                        _p["is_prediction"] = True
                         _preds_to_cache.append(_p)
 
                         if not any(d.get("id") == _dev_id for d in dt_predictions):
