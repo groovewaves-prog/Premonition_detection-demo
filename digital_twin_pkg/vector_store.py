@@ -18,14 +18,6 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # ChromaDB は optional — 未インストール時はダミーモードで動作
-try:
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
-
-    HAS_CHROMADB = True
-except ImportError:
-    HAS_CHROMADB = False
-    logger.info("chromadb not installed — VectorStore will operate in no-op mode")
 
 
 # ──────────────────────────────────────────────
