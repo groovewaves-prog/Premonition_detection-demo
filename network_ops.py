@@ -428,6 +428,7 @@ def generate_analyst_report_streaming(
     max_retries: int = 2,
     backoff: float = 3.0,
     llm_config: dict = None,
+    model_name: str = "gemini-2.0-flash-exp"  # ★ 引数を追加
 ) -> Generator[str, None, None]:
     """
     原因分析レポート（ストリーミング版）
@@ -442,7 +443,9 @@ def generate_analyst_report_streaming(
     # Google API model（ollama_only 以外で必要）
     model = None
     if backend != "ollama_only":
-        model = _get_model(api_key)
+        # _get_model(api_key) を直接使わず、ここで個別にモデルを生成する
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)  # ★ 引数で受け取ったモデル名を使用
         if not model:
             yield "Error: API not configured"
             return
@@ -567,6 +570,7 @@ def generate_remediation_commands_streaming(
     max_retries: int = 2,
     backoff: float = 3.0,
     llm_config: dict = None,
+    model_name: str = "gemini-2.0-flash-exp"  # ★ 引数を追加
 ) -> Generator[str, None, None]:
     """
     復旧手順（ストリーミング版）
@@ -579,7 +583,8 @@ def generate_remediation_commands_streaming(
 
     model = None
     if backend != "ollama_only":
-        model = _get_model(api_key)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)  # ★ 引数で受け取ったモデル名を使用
         if not model:
             yield "Error: API not configured"
             return
@@ -588,7 +593,7 @@ def generate_remediation_commands_streaming(
     
     # ★キャッシュチェック - ヒット時は即座に返却
     device_id = target_node.id if target_node else "Unknown"
-    cache_key = compute_cache_hash(scenario, device_id, "remediation_stream")
+    cache_key = compute_cache_hash(scenario, device_id, f"report_stream_{model_name}")
     
     cached = limiter.get_cache(cache_key)
     if cached:
