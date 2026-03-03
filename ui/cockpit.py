@@ -656,25 +656,49 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                         "signal_count":      len(_msgs_list),
                     }
                 })
-                if _resp.get("ok"):
-                    _preds_to_cache = []
-                    for _p in _resp.get("predictions", []):
-                        _p["id"]     = _dev_id
-                        _p["source"] = _src
-                        _p["prediction_signal_count"] = _signal_count
-                        _p["is_prediction"] = True
-                        _preds_to_cache.append(_p)
+                
+                _preds_returned = _resp.get("predictions", []) if _resp.get("ok") else []
+                
+                # =========================================================
+                # ★修正1: LLMが「まだ正常」と判断して結果を返さなかった場合の強制フォールバック
+                # これにより、レベル1でも確実に右パネルとUIを描画させる
+                # =========================================================
+                if not _preds_returned and _src == "simulation":
+                    _sim_scenario = _injected.get("scenario", "異常")
+                    _preds_returned = [{
+                        "label": f"🔮 [予兆] {_sim_scenario} の初期兆候",
+                        "predicted_state": _sim_scenario,
+                        "prob": min(0.65 + (_sim_level * 0.05), 0.99), # 右パネル表示条件(0.6)を確実に超えさせる
+                        "confidence": min(0.65 + (_sim_level * 0.05), 0.99),
+                        "prediction_timeline": "1〜3日",
+                        "prediction_affected_count": 2,
+                        "prediction_time_to_critical_min": 60,
+                        "prediction_time_to_failure_hours": max(72 - (_sim_level * 12), 2),
+                        "rule_pattern": f"{_sim_scenario}_Auto",
+                        "reasons": _msgs_list,
+                        "recommended_actions": [
+                            {"title": "詳細ログの確認", "effect": "原因特定", "priority": "medium", "steps": "show logging\nshow processes memory"}
+                        ]
+                    }]
 
-                        if not any(d.get("id") == _dev_id for d in dt_predictions):
-                            dt_predictions.append(_p)
+                _preds_to_cache = []
+                for _p in _preds_returned:
+                    _p["id"]     = _dev_id
+                    _p["source"] = _src
+                    _p["prediction_signal_count"] = _signal_count
+                    _p["is_prediction"] = True
+                    _preds_to_cache.append(_p)
 
-                    # キャッシュに保存（同一スライダー位置での再描画を高速化）
-                    st.session_state[_ck_pred_cache][_cache_key] = _preds_to_cache
-                    # キャッシュサイズ制限
-                    if len(st.session_state[_ck_pred_cache]) > 20:
-                        _keys = list(st.session_state[_ck_pred_cache].keys())
-                        for _old_k in _keys[:10]:
-                            st.session_state[_ck_pred_cache].pop(_old_k, None)
+                    if not any(d.get("id") == _dev_id for d in dt_predictions):
+                        dt_predictions.append(_p)
+
+                # キャッシュに保存（同一スライダー位置での再描画を高速化）
+                st.session_state[_ck_pred_cache][_cache_key] = _preds_to_cache
+                # キャッシュサイズ制限
+                if len(st.session_state[_ck_pred_cache]) > 20:
+                    _keys = list(st.session_state[_ck_pred_cache].keys())
+                    for _old_k in _keys[:10]:
+                        st.session_state[_ck_pred_cache].pop(_old_k, None)
 
             except Exception as _pred_err:
                 logger.warning(f"predict_api failed for {_dev_id}: {_pred_err}")
@@ -788,10 +812,10 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
         elif cand.get('prob', 0) > 0.5:
             root_cause_candidates.append(cand)
 
-    if not root_cause_candidates and not alarms:
+    if not root_cause_candidates:
         root_cause_candidates = [{
             "id": "SYSTEM", "label": "正常稼働", "prob": 0.0,
-            "type": "Normal", "tier": 3, "reason": "アラームなし"
+            "type": "Normal", "tier": 3, "reason": "異常は検知されていません"
         }]
 
     if root_cause_candidates and downstream_devices:
@@ -1460,13 +1484,18 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     from collections import defaultdict
                     from datetime import datetime
                     
-                    grouped_preds = defaultdict(list)
-                    for _fp in _open_preds:
-                        _rule = _fp.get("rule_pattern", "不明")
-                        grouped_preds[_rule].append(_fp)
+                    # =========================================================
+                    # ★修正2: 履歴が分裂して2つ以上表示されるバグを防止
+                    # 最新のログが属するパターンを「代表」として1つだけ抽出し表示する
+                    # =========================================================
+                    _open_preds.sort(key=lambda x: float(x.get("created_at", 0)), reverse=True)
+                    _target_rule = _open_preds[0].get("rule_pattern", "不明")
+                    _pred_group = [p for p in _open_preds if p.get("rule_pattern", "不明") == _target_rule]
+                    _rule_pattern = _target_rule
+                    _group_size = len(_pred_group)
                     
-                    for _rule_pattern, _pred_group in grouped_preds.items():
-                        _group_size = len(_pred_group)
+                    # 以下のインデントは崩さず、1回だけ実行させる
+                    if True:
                         
                         # =========================================================
                         # ★ 進化版: LLMによるインシデントタイトルの自動学習＆自動登録機能
