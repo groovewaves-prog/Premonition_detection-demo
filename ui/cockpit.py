@@ -677,9 +677,15 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     }]
 
                 # =========================================================
-                # 【真のAI動的生成】究極のJSON抽出 ＆ エラー強制表示版
+                # 【真のAI動的生成】トポロジー連動 ＆ 機器属性認識版
                 # =========================================================
                 if _src == "simulation" and _injected:
+                    # ★ ここでトポロジーから機器情報を取得
+                    ci = _build_ci_context_for_chat(topology, _dev_id)
+                    vendor = ci.get("vendor", "Unknown")
+                    os_type = ci.get("os", "Unknown")
+                    model = ci.get("model", "Unknown")
+
                     for _p in _preds_returned:
                         _actions = _p.get("recommended_actions", [])
                         if not _actions or len(_actions) <= 1:
@@ -689,35 +695,47 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                     import re as _re
                                     genai.configure(api_key=api_key)
                                     
+                                    # ★ 機器情報をプロンプトに注入
                                     _prompt = f"""
                                     あなたは熟練のネットワークAIOpsエンジニアです。
-                                    以下のシステムログから、直ちに実行すべき初動調査コマンドと具体的な復旧アクションを、重要度が高い順に【最大3つまで】JSON形式で出力してください。
+                                    現在、以下の【対象機器】で発生しているシステムログを分析しています。
+                                    この機器の仕様に基づき、CLIで直ちに実行すべき初動調査コマンドと具体的な復旧アクションを、重要度が高い順に【最大3つまで】JSON形式で出力してください。
+
+                                    【対象機器の情報】
+                                    ・ホスト名: {_dev_id}
+                                    ・メーカー: {vendor}
+                                    ・OS: {os_type}
+                                    ・機種名: {model}
+
+                                    【⚠️ 厳守事項：プラットフォームの限定】
+                                    ・対象は上記の「ネットワーク専用機器」です。汎用Linuxサーバではありません。
+                                    ・必ず {vendor} ({os_type}) の正規コマンド（例: {vendor}がCiscoなら 'show ~', Juniperなら 'show ~' や 'request ~'）を使用してください。
+                                    ・Linux用のコマンド（top, ps, grep, kill, systemctl等）は【絶対に含めないでください】。
 
                                     【システムの前提と禁止事項】
-                                    ・この環境は既に高度な監視ツール（Zabbix/Prometheus等）と連携済みであり、アラート通知体制は完璧に構築されています。
-                                    ・そのため、「監視ツールの導入」「アラート閾値の設定追加」「ダッシュボードの構築」といった一般的なシステム監視強化の提案は【絶対に含めないでください】。
-                                    ・回答は、実際のネットワーク機器のCLIで叩くべき具体的なコマンド（show ~ 等）や、再起動・プロセス強制終了などの実務的な運用手順（アクション）に限定してください。
+                                    ・監視ツール（Zabbix等）は導入済みです。「監視ツールの導入」や「アラート設定の強化」といった間接的な提案は不要です。
+                                    ・現場の運用者がその場で機器にログインして叩くべき「直接的なアクション」に限定してください。
 
                                     【対象ログ】
                                     {_combined_msg[:1000]}
 
                                     【出力JSONフォーマット】
-                                    必ず以下のキー構造のJSON配列（リスト）のみを出力してください。他の文章やMarkdownブロックは一切不要です。
+                                    必ず以下のキー構造のJSON配列（リスト）のみを出力してください。
                                     [
                                       {{
                                         "title": "アクションのタイトル",
                                         "effect": "この手順で得られる効果",
                                         "priority": "high",
-                                        "rationale": "なぜこの手順が必要かのプロ視点の根拠",
-                                        "steps": "具体的な手順やコマンド (改行は \\n を使用)"
+                                        "rationale": "{vendor}の{model}におけるこの手順の必要性",
+                                        "steps": "具体的なネットワーク機器用コマンド (改行は \\n を使用)"
                                       }}
                                     ]
                                     """
                                     
-                                    _model = genai.GenerativeModel('gemma-3-4b-it')
+                                    # ★ gemma-3-4b-it または gemini-2.0-flash-exp を指定
+                                    _model = genai.GenerativeModel('gemini-2.0-flash-exp') 
                                     _response = _model.generate_content(_prompt)
                                     
-                                    # ★ 余計な文章を無視して、JSON配列「[ ... ]」の部分だけを強引にくり抜く最強の正規表現
                                     _match = _re.search(r'\[\s*\{.*?\}\s*\]', _response.text, _re.DOTALL)
                                     
                                     if _match:
@@ -726,10 +744,9 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                         if isinstance(_dynamic_actions, list) and len(_dynamic_actions) > 0:
                                             _p["recommended_actions"] = _dynamic_actions[:3]
                                     else:
-                                        raise ValueError("AIの回答からJSON配列が見つかりませんでした。")
+                                        raise ValueError("AIの回答からJSONが見つかりませんでした。")
                                         
                                 except Exception as e:
-                                    # ★ エラーが起きた場合、握りつぶさずに「推奨アクション」の画面に直接エラー内容を表示させる
                                     _err_msg = str(e)
                                     _raw_resp = getattr(_response, "text", "レスポンスなし") if '_response' in locals() else "未実行"
                                     _p["recommended_actions"] = [{
@@ -739,7 +756,6 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                         "rationale": f"エラー詳細: {_err_msg}",
                                         "steps": f"【AIの生の回答】\n{_raw_resp}"
                                     }]
-
                         # =========================================================
                         # ソートバグの完全修正（優先度順に強制並び替え）
                         # =========================================================
