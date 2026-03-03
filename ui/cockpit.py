@@ -165,8 +165,13 @@ def _sanitize_prediction_context(text: str, max_len: int = 800) -> str:
 
 def _build_prediction_report_scenario(cand: dict, signal_count: int = 1) -> str:
     """
-    予兆用レポートシナリオを構築（RUL予測ベース）
-    運用者視点: 「今後N日後に障害発生」表現で統一
+    ② 確認手順レポート（診断ワークブック）
+    
+    役割: 「本当に危ないのか？ どう判断する？」
+    ・① 推奨アクションの初動調査を「実行済み」前提で、その結果の読み方を詳説
+    ・show系コマンドの出力例 + OK/NGの判定基準表を提示
+    ・エスカレーション判断のデシジョンツリーを含む
+    ・config系（変更系）コマンドは含めない
     """
     dev_id        = cand.get('id', '不明')
     pred_state    = cand.get('predicted_state') or cand.get('label', '').replace('🔮 [予兆] ', '') or '不明'
@@ -177,16 +182,13 @@ def _build_prediction_report_scenario(cand: dict, signal_count: int = 1) -> str:
     confidence    = float(cand.get('confidence', cand.get('prob', 0.5)))
     rule_pattern  = cand.get('rule_pattern', '')
     reasons       = cand.get('reasons', [])
+    rec_actions   = cand.get('recommended_actions', [])
 
-    # RUL表示: 今後N日後に障害発生
+    # RUL表示
     if ttf_hours >= 24:
-        ttf_display = f"今後{ttf_hours // 24}日後に障害発生の見込み"
-        if failure_dt:
-            ttf_display += f"（{failure_dt}頃）"
+        ttf_display = f"今後{ttf_hours // 24}日後に障害発生の見込み（{failure_dt}頃）" if failure_dt else f"今後{ttf_hours // 24}日後に障害発生の見込み"
     elif ttf_hours > 0:
-        ttf_display = f"今後{ttf_hours}時間後に障害発生の見込み"
-        if failure_dt:
-            ttf_display += f"（{failure_dt}頃）"
+        ttf_display = f"今後{ttf_hours}時間後に障害発生の見込み（{failure_dt}頃）" if failure_dt else f"今後{ttf_hours}時間後に障害発生の見込み"
     else:
         ttf_display = "障害が切迫しています"
 
@@ -194,21 +196,77 @@ def _build_prediction_report_scenario(cand: dict, signal_count: int = 1) -> str:
         _sanitize_prediction_context(r, 120) for r in reasons[:3]
     ) if reasons else rule_pattern
 
+    # ① で提示済みの初動コマンドを一覧化（「これは書くな」リストとして使う）
+    initial_cmds_list = []
+    initial_triage_summary = ""
+    if rec_actions:
+        _items = []
+        for a in rec_actions[:3]:
+            _title = a.get('title', '') if isinstance(a, dict) else str(a)
+            _steps = a.get('steps', '') if isinstance(a, dict) else ''
+            _items.append(f"  - {_title}" + (f" ({_steps.replace(chr(10), '; ')[:60]})" if _steps else ""))
+            # 個別コマンドを抽出（重複排除用）
+            if _steps:
+                for _cmd in _steps.replace(chr(10), '\n').split('\n'):
+                    _cmd = _cmd.strip()
+                    if _cmd and not _cmd.startswith('#'):
+                        initial_cmds_list.append(_cmd)
+        initial_triage_summary = "\n".join(_items)
+
     lines = [
-        f"[RUL予測] {dev_id}で障害の前兆を検出（信頼度{confidence*100:.0f}%）。{signal_count}件のシグナルを確認。",
+        f"[診断ワークブック] {dev_id}の予兆検知に対する確認手順書を作成してください。",
+        f"",
+        f"【状況サマリ】",
         f"・予測障害: {pred_state}",
         f"・障害発生予測: {ttf_display}",
+        f"・AI確信度: {confidence*100:.0f}%",
         f"・急性期進行: 症状発症後{ttc_min}分でサービス断に至る恐れ",
         f"・影響範囲: 配下{pred_affected}台に通信断リスク",
         f"・検出シグナル: {reason_summary}",
-        "以下を簡潔に提供してください（各項目3行以内）:",
-        "1.予兆パターン解説 2.確認コマンド 3.判定基準 4.予防措置 5.エスカレーション",
+    ]
+    if initial_triage_summary:
+        lines += [
+            f"",
+            f"【⚠️ 重要: 以下は「推奨アクション」として運用者の画面に既に表示済みです】",
+            initial_triage_summary,
+        ]
+    if initial_cmds_list:
+        lines += [
+            f"",
+            f"【🚫 絶対に再掲しないでくださいコマンド一覧】",
+            f"以下のコマンドは既に表示済みのため、このレポートに含めると冗長になります:",
+        ] + [f"  × {c}" for c in initial_cmds_list[:10]]
+
+    lines += [
+        f"",
+        f"【このレポートの目的と役割分担】",
+        f"運用者の画面には3段階の情報が表示されます:",
+        f"  ①「推奨アクション」（表示済み）: 最初の5分で打つshow系コマンド → 現状把握",
+        f"  ②「このレポート」（今から生成）: ①の結果を読み解き、危険度を判定する → 判断支援",
+        f"  ③「予防措置プラン」（次の手順）: 対処が必要な場合のconfig変更手順 → 実行",
+        f"",
+        f"このレポートは②の役割です。①のコマンドは再掲せず、以下に集中してください:",
+        f"",
+        f"1. 深掘り診断コマンド: ①に含まれない追加調査コマンド（show系のみ・config変更禁止）",
+        f"   ①のコマンド結果だけでは判断できない場合に実行する「次の一手」を提示",
+        f"2. 出力の読み方ガイド: 各コマンド出力の「どのフィールドを見るか」「正常値はいくつか」を具体的に",
+        f"3. OK/NG判定基準表: | 確認項目 | 正常(OK) | 要注意 | 異常(NG) | の表形式",
+        f"4. エスカレーション判断フロー: 「NGがN個以上 → 即エスカレーション」のデシジョンツリー",
+        f"   判断結果ごとに「経過観察」「計画メンテナンス」「緊急対応」を明記",
+        f"5. 経過観察のポイント: 再確認タイミング（例: 30分後）と監視強化すべきカウンタ",
     ]
     return "\n".join(lines)
 
 
 def _build_prevention_plan_scenario(cand: dict) -> str:
-    """予防措置プラン用シナリオ（RUL予測ベース）"""
+    """
+    ③ 予防措置プラン（メンテナンス作業計画書）
+    
+    役割: 「メンテナンス窓で何をやる？」→ 復旧実行ボタンで自動実行
+    ・② 確認手順の診断結果を「危険と判定された」前提で、具体的な予防config投入手順を提示
+    ・config系コマンドを含む（自動実行対象）
+    ・バックアップ → 変更投入 → ロールバック手順 → 正常性確認の一連の流れ
+    """
     dev_id        = cand.get('id', '不明')
     pred_state    = cand.get('predicted_state') or cand.get('label', '').replace('🔮 [予兆] ', '') or '不明'
     pred_affected = int(cand.get('prediction_affected_count', 0))
@@ -216,28 +274,61 @@ def _build_prevention_plan_scenario(cand: dict) -> str:
     ttf_hours     = int(cand.get('prediction_time_to_failure_hours', 0))
     failure_dt    = cand.get('prediction_failure_datetime', '')
     rec_actions   = cand.get('recommended_actions', [])
+    rule_pattern  = cand.get('rule_pattern', '')
+    confidence    = float(cand.get('confidence', cand.get('prob', 0.5)))
 
     # RUL表示
     if ttf_hours >= 24:
-        ttf_ctx = f"今後{ttf_hours // 24}日後に障害発生"
-        if failure_dt:
-            ttf_ctx += f"（{failure_dt}頃）"
+        ttf_ctx = f"今後{ttf_hours // 24}日後に障害発生（{failure_dt}頃）" if failure_dt else f"今後{ttf_hours // 24}日後に障害発生"
     else:
         ttf_ctx = f"今後{ttf_hours}時間後に障害発生" if ttf_hours > 0 else "障害が切迫"
 
-    actions_txt = ""
+    # ① の初動結果を前提情報に
+    actions_summary = ""
     if rec_actions:
-        actions_txt = " 既知の推奨: " + ", ".join(
-            _sanitize_prediction_context(a.get('title',''), 60) for a in rec_actions[:3])
+        _items = []
+        for a in rec_actions[:3]:
+            _title = a.get('title', '') if isinstance(a, dict) else str(a)
+            _steps = a.get('steps', '') if isinstance(a, dict) else ''
+            _items.append(f"  - {_title}" + (f": {_steps.replace(chr(10), '; ')[:80]}" if _steps else ""))
+        actions_summary = "\n".join(_items)
 
     lines = [
-        f"[予防措置] {dev_id}の障害予兆に対する予防措置プラン。",
+        f"[予防措置プラン] {dev_id}の障害予兆に対するメンテナンス作業計画書を作成してください。",
+        f"",
+        f"【状況サマリ】",
         f"・予測障害: {pred_state}",
         f"・障害発生予測: {ttf_ctx}",
+        f"・AI確信度: {confidence*100:.0f}%",
         f"・急性期進行: 症状発症後{ttc_min}分でサービス断",
-        f"・影響範囲: 配下{pred_affected}台{actions_txt}",
-        "「復旧」ではなく「予防措置・事前対応」として簡潔に提示（各手順2行以内）:",
-        "1.即時点検 2.予防コマンド 3.メンテナンス計画 4.監視強化 5.エスカレーション判断基準",
+        f"・影響範囲: 配下{pred_affected}台に影響の可能性",
+        f"・検出ルール: {rule_pattern}",
+    ]
+    if actions_summary:
+        lines += [
+            f"",
+            f"【初動トリアージで実施済みの内容】",
+            actions_summary,
+        ]
+    lines += [
+        f"",
+        f"【このプランの目的と役割分担】",
+        f"運用者の画面には3段階の情報が表示されます:",
+        f"  ①「推奨アクション」（表示済み）: show系コマンドで現状把握 → 完了済み",
+        f"  ②「確認手順レポート」（実施済み）: 診断結果の読み方と判定 → 「対処が必要」と判断済み",
+        f"  ③「このプラン」（今から生成）: 具体的なconfig変更による予防措置 → 自動実行される",
+        f"",
+        f"このプランは③の役割です。①②のshow系コマンドは一切含めず、以下に集中してください:",
+        f"",
+        f"⚠️ 重要: このプランの「予防コマンド」セクションは「復旧実行」ボタンで自動実行されます。",
+        f"  → コマンドはコードブロック（```）で囲み、1行1コマンドで、実行可能な形式で記載してください。",
+        f"  → show系（状態確認）コマンドはここに含めないでください（それは①②の役割です）。",
+        f"",
+        f"1. 実施前提: メンテナンス窓の要否、関係部門への事前連絡事項、影響範囲の再確認",
+        f"2. バックアップ手順: 作業前に取得すべきバックアップコマンド",
+        f"3. 予防コマンド: 障害を未然に防ぐためのconfig系設定変更コマンド（各コマンドに目的を1行で添える）",
+        f"4. ロールバック手順: 予防措置で問題が発生した場合の切り戻しコマンド",
+        f"5. 正常性確認: 作業完了後に実施すべき確認コマンドと期待される正常値",
     ]
     return "\n".join(lines)
 
@@ -695,11 +786,17 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                     import re as _re
                                     genai.configure(api_key=api_key)
                                     
-                                    # ★ 機器情報をプロンプトに注入
+                                    # ★ 機器情報をプロンプトに注入（初動トリアージ専用）
                                     _prompt = f"""
                                     あなたは熟練のネットワークAIOpsエンジニアです。
-                                    現在、以下の【対象機器】で発生しているシステムログを分析しています。
-                                    この機器の仕様に基づき、CLIで直ちに実行すべき初動調査コマンドと具体的な復旧アクションを、重要度が高い順に【最大3つまで】JSON形式で出力してください。
+                                    現在、以下の【対象機器】で予兆シグナルを検知しました。
+                                    運用者が【最初の5分以内】にCLIで実行すべき「初動トリアージ」コマンドを、重要度順に【最大3つまで】JSON形式で出力してください。
+
+                                    【★ 初動トリアージの定義（厳守）】
+                                    ・目的: 「現状の把握」のみ。状態確認（show系）コマンドだけを提示する
+                                    ・禁止: config系コマンド（設定変更・復旧措置）は絶対に含めない
+                                    ・禁止: 詳細な診断手順や判定基準の解説は不要（それは別レポートの役割）
+                                    ・各コマンドは「何を確認するか」を1行で添え、効果は「この値が分かる」程度に留める
 
                                     【対象機器の情報】
                                     ・ホスト名: {_dev_id}
@@ -711,10 +808,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                     ・対象は上記の「ネットワーク専用機器」です。汎用Linuxサーバではありません。
                                     ・必ず {vendor} ({os_type}) の正規コマンド（例: {vendor}がCiscoなら 'show ~', Juniperなら 'show ~' や 'request ~'）を使用してください。
                                     ・Linux用のコマンド（top, ps, grep, kill, systemctl等）は【絶対に含めないでください】。
-
-                                    【システムの前提と禁止事項】
-                                    ・監視ツール（Zabbix等）は導入済みです。「監視ツールの導入」や「アラート設定の強化」といった間接的な提案は不要です。
-                                    ・現場の運用者がその場で機器にログインして叩くべき「直接的なアクション」に限定してください。
+                                    ・監視ツール（Zabbix等）は導入済みのため、「監視設定の強化」等の提案は不要です。
 
                                     【対象ログ】
                                     {_combined_msg[:1000]}
@@ -723,11 +817,11 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                     必ず以下のキー構造のJSON配列（リスト）のみを出力してください。
                                     [
                                       {{
-                                        "title": "アクションのタイトル",
-                                        "effect": "この手順で得られる効果",
+                                        "title": "確認項目のタイトル（例: メモリ使用状況の確認）",
+                                        "effect": "このコマンドで分かること（1行）",
                                         "priority": "high",
-                                        "rationale": "{vendor}の{model}におけるこの手順の必要性",
-                                        "steps": "具体的なネットワーク機器用コマンド (改行は \\n を使用)"
+                                        "rationale": "なぜ最初にこれを確認すべきか（1行）",
+                                        "steps": "show系コマンドのみ (改行は \\n を使用)"
                                       }}
                                     ]
                                     """
@@ -1011,9 +1105,13 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                             if rule_pattern:
                                 st.caption(f"適用ルール: `{rule_pattern}`")
 
-                    # ── 推奨アクション ─────────────────────────────
+                    # ── ① 初動トリアージ（推奨アクション） ──────────────
                     if rec_actions:
-                        with st.expander("🛠️ 推奨アクション", expanded=True):
+                        with st.expander("🛠️ 初動トリアージ（推奨アクション）", expanded=True):
+                            st.caption(
+                                "⏱️ **最初の5分**: 状況把握のためのshowコマンドです。"
+                                "  詳細診断 → 「確認手順を生成」 / 予防措置 → 「予防措置プランを生成」"
+                            )
                             for idx, _act in enumerate(rec_actions, 1):
                                 _title = _act.get('title', '')
                                 _effect = _act.get('effect', '')
@@ -1250,8 +1348,15 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
 
                 if api_key and (scenario != "正常稼働" or cand.get('is_prediction')):
                     is_pred = cand.get('is_prediction')
-                    btn_label = ("🔮 予兆の確認手順を生成 (Predictive Analysis)"
-                                 if is_pred else "📝 詳細レポートを作成 (Generate Report)")
+                    
+                    if is_pred:
+                        btn_label = "🔮 予兆の確認手順を生成 (Predictive Analysis)"
+                        st.caption(
+                            "📋 **ステップ②**: 初動トリアージの次に実施する詳細診断。"
+                            "出力の読み方・OK/NG判定基準・エスカレーション判断を提示します。"
+                        )
+                    else:
+                        btn_label = "📝 詳細レポートを作成 (Generate Report)"
 
                     if st.button(btn_label):
                         report_container = st.empty()
@@ -1348,6 +1453,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 affected    = selected_incident_candidate.get('prediction_affected_count', 0)
                 ttf_hours   = selected_incident_candidate.get('prediction_time_to_failure_hours', 0)
                 failure_dt  = selected_incident_candidate.get('prediction_failure_datetime', '')
+                ttc_min     = selected_incident_candidate.get('prediction_time_to_critical_min', 0)
                 
                 # RUL表示
                 if ttf_hours >= 24:
@@ -1361,12 +1467,15 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                 else:
                     ttf_display = "<b>障害が切迫</b>"
                 
+                # 急性期進行表示
+                ttc_display = f"症状発症後 <b>{ttc_min}分後</b>" if ttc_min > 0 else f"<b>{timeline}</b>"
+                
                 st.markdown(f"""
                 <div style="background-color:#fff3e0;padding:10px;border-radius:5px;border:1px solid #ff9800;color:#e65100;margin-bottom:10px;">
                     <strong>🔮 Digital Twin 未来予測 (Predictive Maintenance)</strong><br>
                     <b>{selected_incident_candidate['id']}</b> で障害の兆候を検出しました。<br>
                     ・障害発生予測: {ttf_display}<br>
-                    ・急性期進行: 症状発症後 <b>{timeline}</b> でサービス断の恐れ<br>
+                    ・急性期進行: {ttc_display} でサービス断の恐れ<br>
                     ・影響範囲: <b>{affected}台</b> のデバイスに影響の可能性<br>
                     ・推奨: メンテナンスウィンドウでの予防交換/対応<br>
                     (信頼度: <span style="font-size:1.2em;font-weight:bold;">{selected_incident_candidate['prob']*100:.0f}%</span>)
@@ -1383,8 +1492,16 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
 
             # ★ Generate Fix ボタン（remediation_plan 未生成時のみ表示）
             if st.session_state.remediation_plan is None:
-                fix_label    = "🔮 予防措置プランを生成 (Preventive Measures)" if is_pred_rem else "✨ 修復プランを作成 (Generate Fix)"
-                report_prereq = "「🔮 予兆の確認手順を生成」" if is_pred_rem else "「📝 詳細レポートを作成 (Generate Report)」"
+                if is_pred_rem:
+                    fix_label    = "🔮 予防措置プランを生成 (Preventive Measures)"
+                    report_prereq = "「🔮 予兆の確認手順を生成」"
+                    st.caption(
+                        "📋 **ステップ③**: 確認手順の診断結果を踏まえたメンテナンス作業計画書。"
+                        "config系の予防コマンドを含み、「復旧実行」ボタンで自動実行できます。"
+                    )
+                else:
+                    fix_label    = "✨ 修復プランを作成 (Generate Fix)"
+                    report_prereq = "「📝 詳細レポートを作成 (Generate Report)」"
 
                 if st.button(fix_label):
                     if st.session_state.generated_report is None:
