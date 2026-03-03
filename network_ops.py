@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # =====================================================
 # 定数
 # =====================================================
-MODEL_NAME = "gemma-3-12b-it"
+MODEL_NAME = "gemma-3-4b-it"
 
 SANDBOX_DEVICE = {
     'device_type': 'cisco_nxos',
@@ -428,7 +428,7 @@ def generate_analyst_report_streaming(
     max_retries: int = 2,
     backoff: float = 3.0,
     llm_config: dict = None,
-    model_name: str = "gemini-2.0-flash-exp"  # ★ 引数を追加
+    model_name: str = "gemma-3-4b-it"  # ★ 引数を追加
 ) -> Generator[str, None, None]:
     """
     原因分析レポート（ストリーミング版）
@@ -570,7 +570,7 @@ def generate_remediation_commands_streaming(
     max_retries: int = 2,
     backoff: float = 3.0,
     llm_config: dict = None,
-    model_name: str = "gemini-2.0-flash-exp"  # ★ 引数を追加
+    model_name: str = "gemma-3-4b-it"  # ★ 引数を追加
 ) -> Generator[str, None, None]:
     """
     復旧手順（ストリーミング版）
