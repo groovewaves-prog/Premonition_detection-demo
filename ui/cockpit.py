@@ -633,10 +633,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
             try:
                 _combined_msg = "\n".join(_msgs_list)
                 
-                # =========================================================
-                # ★修正: キャッシュキーの先頭に "v2_" を付けて、過去の古い記憶を強制リセット
-                # =========================================================
-                _cache_key = f"v2_{_dev_id}|{_sim_level}|{hash(_combined_msg[:200])}"
+                _cache_key = f"v3_{_dev_id}|{_sim_level}|{hash(_combined_msg[:200])}"
 
                 # キャッシュチェック
                 _cached = st.session_state[_ck_pred_cache].get(_cache_key)
@@ -683,20 +680,16 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     }]
 
                 # =========================================================
-                # 【真のAI動的生成】ハードコードを排除し、GeminiにJSONで作らせる
+                # 【真のAI動的生成】Markdownフェンス除去付きの堅牢版
                 # =========================================================
                 if _src == "simulation" and _injected:
                     for _p in _preds_returned:
                         _actions = _p.get("recommended_actions", [])
-                        # アクションが1つしかない（汎用フォールバック）か、空の場合に動的生成
                         if not _actions or len(_actions) <= 1:
                             if api_key and GENAI_AVAILABLE:
                                 try:
                                     import json as _json
-                                    
-                                    # =========================================================
-                                    # ★修正: APIキーを明示的にセット（これがないと裏側で通信エラーになり失敗する）
-                                    # =========================================================
+                                    import re as _re
                                     genai.configure(api_key=api_key)
                                     
                                     _prompt = f"""
@@ -706,30 +699,37 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                     【対象ログ】
                                     {_combined_msg[:1000]}
 
-                                    【出力JSONフォーマット（このキー構造に厳密に従うこと）】
+                                    【出力JSONフォーマット（必ず以下のキー構造の配列にすること）】
                                     [
                                       {{
-                                        "title": "アクションのタイトル (例: プロセスメモリ消費状況の特定)",
+                                        "title": "アクションのタイトル",
                                         "effect": "この手順で得られる効果",
                                         "priority": "high",  // high, medium, low のいずれか
                                         "rationale": "なぜこの手順が必要かのプロ視点の根拠",
                                         "steps": "具体的な手順やコマンド (改行は \\n を使用)"
                                       }}
                                     ]
+                                    ※解説やMarkdownのコードブロック(```json)は一切含めず、純粋なJSON配列のみをテキストで出力してください。
                                     """
-                                    # JSON出力を強制するコンフィグを追加してハルシネーションを防止
-                                    _model = genai.GenerativeModel(
-                                        'gemini-1.5-flash', 
-                                        generation_config={"response_mime_type": "application/json"}
-                                    )
+                                    
+                                    # バージョン非互換エラーを防ぐため generation_config を削除し、標準で呼び出す
+                                    _model = genai.GenerativeModel('gemini-1.5-flash')
                                     _response = _model.generate_content(_prompt)
-                                    _dynamic_actions = _json.loads(_response.text)
+                                    
+                                    # ★ AIがつけてしまった ```json 等の装飾を強制的に剥がす
+                                    _raw_text = _response.text.strip()
+                                    _raw_text = _re.sub(r'^```(?:json)?\s*', '', _raw_text, flags=_re.IGNORECASE)
+                                    _raw_text = _re.sub(r'\s*```$', '', _raw_text)
+                                    
+                                    _dynamic_actions = _json.loads(_raw_text)
                                     
                                     if isinstance(_dynamic_actions, list) and len(_dynamic_actions) > 0:
                                         _p["recommended_actions"] = _dynamic_actions[:3]
                                 except Exception as e:
                                     import logging
                                     logging.warning(f"Dynamic action generation failed: {e}")
+                                    # ★ なぜ失敗したか画面上で一目でわかるように通知を出す
+                                    st.toast(f"⚠️ 復旧プランのAI動的生成に失敗: {type(e).__name__}", icon="⚠️")
 
                         # =========================================================
                         # ソートバグの完全修正（優先度順に強制並び替え）
@@ -750,9 +750,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                     if not any(d.get("id") == _dev_id for d in dt_predictions):
                         dt_predictions.append(_p)
 
-                # キャッシュに保存（同一スライダー位置での再描画を高速化）
                 st.session_state[_ck_pred_cache][_cache_key] = _preds_to_cache
-                # キャッシュサイズ制限
                 if len(st.session_state[_ck_pred_cache]) > 20:
                     _keys = list(st.session_state[_ck_pred_cache].keys())
                     for _old_k in _keys[:10]:
