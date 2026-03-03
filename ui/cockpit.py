@@ -709,7 +709,7 @@ def render_incident_cockpit(site_id: str, api_key: Optional[str]):
                                     ]
                                     """
                                     
-                                    _model = genai.GenerativeModel('gemini-2.5-flash-lite')
+                                    _model = genai.GenerativeModel('gemma-3-4b-it')
                                     _response = _model.generate_content(_prompt)
                                     
                                     # ★ 余計な文章を無視して、JSON配列「[ ... ]」の部分だけを強引にくり抜く最強の正規表現
