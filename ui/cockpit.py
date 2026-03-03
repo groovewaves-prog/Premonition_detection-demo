@@ -320,7 +320,7 @@ def run_diagnostic(scenario: str, target_node_obj, use_llm: bool = True) -> dict
                 import google.generativeai as genai
                 client = genai.Client(api_key=api_key)
                 response = client.models.generate_content(
-                    model='gemini-1.5-flash',
+                    model='Gemma-3-4b-it',
                     contents=prompt
                 )
                 
