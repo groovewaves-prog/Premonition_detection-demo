@@ -87,7 +87,8 @@ class StorageManager:
     # --- SQLite Init & Schema ---
     def _init_sqlite(self):
         try:
-            self._conn = sqlite3.connect(self.paths["sqlite_db"], check_same_thread=False)
+            # ★修正: timeout=20.0 を追加し、並行アクセス時の「Database is locked」エラーを回避
+            self._conn = sqlite3.connect(self.paths["sqlite_db"], check_same_thread=False, timeout=20.0)
             self._conn.execute('PRAGMA journal_mode=WAL;')
             with self._db_lock:
                 self._conn.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT, updated_at REAL)')
