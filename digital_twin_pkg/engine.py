@@ -153,12 +153,12 @@ class DigitalTwinEngine:
         )
 
         # Phase 6c*: ChromaDB ベクトルストア（類似インシデント検索）
-        _vs_dir = os.path.join(BASE_DIR, ".dt_storage", "global_chromadb")
+        _vs_dir = os.path.join(BASE_DIR, ".dt_storage", self.tenant_id, "chromadb")
         self.vector_store = VectorStore(
             persist_directory=_vs_dir,
             tenant_id=self.tenant_id,
         )
-        self.rules: List[EscalationRule] =[]
+        self.rules: List[EscalationRule] = []
         self._metric_rules: List[EscalationRule] = []
         self.history: List[Dict] = []
         self.outcomes: List[Dict] = []
@@ -446,23 +446,12 @@ class DigitalTwinEngine:
                 # 代表的なデバイスのデータを使用
                 representative = max(devices, key=lambda d: d['affected_count'])
                 
-                # ★追加: バッチ処理時も Federated RAG で他拠点の知見を検索
-                fk =[]
-                if self.vector_store and self.vector_store.is_ready:
-                    try:
-                        fk = self.vector_store.search_similar_alarms(
-                            alarm_text=representative['messages'][0],
-                            n_results=2, min_similarity=0.4, resolved_only=True
-                        )
-                    except Exception: pass
-                
                 llm_actions = self._generate_actions_with_gemini(
                     rule_pattern=pattern,
                     affected_count=total_affected,
                     confidence=sum(d['confidence'] for d in devices) / len(devices),
                     messages=representative['messages'],
-                    device_id=representative['device_id'],
-                    federated_knowledge=fk  # ★追加
+                    device_id=representative['device_id']
                 )
                 
                 if llm_actions:
@@ -479,7 +468,6 @@ class DigitalTwinEngine:
         confidence: float,
         messages: List[str],
         device_id: str
-        federated_knowledge: Optional[List[Dict]] = None  # ★追加
     ) -> Optional[List[Dict[str, str]]]:
         """
         Gemini API を使って状況に応じた推奨アクションを動的生成
@@ -547,31 +535,7 @@ class DigitalTwinEngine:
 ```
 {chr(10).join(f"{i+1:3d}. {msg[:200]}" for i, msg in enumerate(sanitized_messages))}
 ```
-"""
-            # ==========================================================
-            # ★追加: Federated Knowledge (他拠点の解決事例) をプロンプトに注入
-            # ==========================================================
-            if federated_knowledge:
-                fk_text = "\n【💡 Federated Knowledge (全拠点の過去の解決事例)】\n"
-                fk_text += "以下の事例は、他拠点で過去に発生し解決に至った類似ケースです。これらの知見を「最優先で考慮」して推奨アクションを生成してください。\n"
-                for i, fk in enumerate(federated_knowledge):
-                    _sim = fk.get('similarity', 0.0) * 100
-                    _vc = fk.get('vendor_context', '不明な機器')
-                    _out = fk.get('outcome', '不明')
-                    fk_text += f"  - 事例{i+1} (類似度{_sim:.0f}%):[{_vc}] にて「{_out}」として解決済み。\n"
-                prompt += fk_text + "\n"
 
-            # プロンプトの続き（ステップ1〜）を結合
-            prompt += f"""
-【🔍 あなたのタスク - ステップ1: アラームパターンの分析】
-上記の{len(sanitized_messages)}件のアラームメッセージを詳しく分析してください：
-
-**質問:**
-1. どのコンポーネント/インターフェースが影響を受けていますか？
-   - 同じインターフェース番号が繰り返し？
-   - 複数の異なるインターフェース？
-   - 範囲は？（例: Gi0/0/1からGi0/0/28まで）
-"""
 【🔍 あなたのタスク - ステップ1: アラームパターンの分析】
 上記の{len(sanitized_messages)}件のアラームメッセージを詳しく分析してください：
 
@@ -690,7 +654,6 @@ class DigitalTwinEngine:
         device_id: str,
         base_actions: List[Dict[str, str]],
         llm_cache: Optional[Dict[str, List[Dict[str, str]]]] = None
-        federated_knowledge: Optional[List[Dict]] = None  # ★追加
     ) -> List[Dict[str, str]]:
         """
         ★ 推奨アクション生成（LLM真因推論 + ルールベースフォールバック）
@@ -714,7 +677,6 @@ class DigitalTwinEngine:
                 confidence=confidence,
                 messages=messages,
                 device_id=device_id
-                federated_knowledge=federated_knowledge  # ★追加: Gemini呼び出しに渡す
             )
             if llm_actions:
                 return llm_actions
@@ -775,6 +737,15 @@ class DigitalTwinEngine:
                 "history_base": 0.20,  "history_growth": 0.14,
                 "interaction_base": 0.30, "interaction_growth": 0.15,
                 "change_base": 0.15,   "change_growth": 0.08,
+            },
+            "memory_leak": {
+                "name": "メモリリーク",
+                "semantic_base": 0.60, "semantic_growth": 0.09,
+                "trend_base": 0.50,    "trend_growth": 0.12,
+                "volatility_base": 0.15, "volatility_growth": 0.08,
+                "history_base": 0.35,  "history_growth": 0.14,
+                "interaction_base": 0.20, "interaction_growth": 0.16,
+                "change_base": 0.10,   "change_growth": 0.06,
             },
         }
         # デフォルトプロファイル
@@ -854,6 +825,13 @@ class DigitalTwinEngine:
                 3: f"経路不安定が拡大。{_msg_count}件のピアで再送率が上昇し、経路収束に時間がかかっています。ネットワーク全体の経路品質が劣化中です。",
                 4: f"重大な経路障害の兆候。複数のBGPピアでネイバーダウンのリスクが切迫しており、大規模な通信断につながる恐れがあります。",
                 5: f"経路制御が崩壊寸前。BGPセッションの大部分で再送が発生し、経路テーブルの整合性が失われています。即座の経路制御介入が不可欠です。",
+            },
+            "memory_leak": {
+                1: f"メモリ使用量の微小な上昇傾向を検知。現時点では許容範囲内ですが、プロセッサプールの空き容量を継続監視してください。",
+                2: f"メモリ使用率の上昇が継続。{_msg_count}件のメモリ関連警告が発生しています。特定プロセスによるメモリリークの初期兆候の可能性があります。",
+                3: f"メモリ枯渇が進行中。{_msg_count}件のシグナルが警告閾値を超えています。メモリアロケーション失敗（MALLOCFAIL）が発生し始めており、プロセスの異常終了リスクが高まっています。",
+                4: f"重大なメモリ枯渇を検知。プロセッサプールの空き容量が危険水準に達し、メモリアロケーション失敗が頻発しています。システムクラッシュのリスクが切迫しており、計画的な再起動を強く推奨します。",
+                5: f"メモリが壊滅的に枯渇。プロセッサプールの空き容量がほぼゼロに達し、連続的なMALLOCFAILが発生しています。自然復旧は不可能であり、即座の再起動が不可欠です。",
             },
         }
         _default_narratives = {
@@ -1576,26 +1554,13 @@ class DigitalTwinEngine:
                         _top.rule_pattern, _comp_count
                     )
                 else:
-                    # ★追加: 単一デバイス処理時も Federated RAG で他拠点の知見を検索
-                    _fk =[]
-                    if not _use_fast_scoring and hasattr(self, 'vector_store') and self.vector_store and self.vector_store.is_ready:
-                        try:
-                            _fk = self.vector_store.search_similar_alarms(
-                                alarm_text=msg_n,
-                                n_results=2, min_similarity=0.4, resolved_only=True
-                            )
-                        except Exception as e: 
-                            logger.debug(f"Federated search failed: {e}")
-
                     _smart = self._generate_smart_recommendations(
                         rule_pattern   = _top.rule_pattern,
                         affected_count = _comp_count,
                         confidence     = _top.confidence,
-                        messages       =[m.strip() for m in msg_n.split("\n") if m.strip()],
+                        messages       = [m.strip() for m in msg_n.split("\n") if m.strip()],
                         device_id      = device_id,
                         base_actions   = _top.recommended_actions,
-                        llm_cache      = llm_recommendations_cache,
-                        federated_knowledge = _fk  # ★追加: 検索結果を渡す
                     )
                 if _smart:
                     _top.recommended_actions = _smart
