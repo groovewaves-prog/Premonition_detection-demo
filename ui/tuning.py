@@ -5,12 +5,29 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import os
+import time
+import hashlib
 
 # ==========================================
 # ★ 追加: Streamlitグローバルキャッシュによるエンジンの保持
 # ==========================================
+
+def _compute_topo_hash(topology: dict) -> str:
+    """トポロジーの構成変更を検知するための軽量ハッシュを計算"""
+    try:
+        keys = sorted(list(topology.keys()))
+        state = []
+        for k in keys:
+            node = topology[k]
+            pid = node.get('parent_id') if isinstance(node, dict) else getattr(node, 'parent_id', None)
+            rg = node.get('redundancy_group') if isinstance(node, dict) else getattr(node, 'redundancy_group', None)
+            state.append(f"{k}|{pid}|{rg}")
+        return hashlib.md5(",".join(state).encode()).hexdigest()
+    except Exception:
+        return str(time.time())
+
 @st.cache_resource(show_spinner="AI推論エンジンを初期化中...（初回のみ数秒かかります）")
-def _get_cached_engine(site_id: str):
+def _get_cached_engine(site_id: str, topo_hash: str):  # ★修正: topo_hash を追加
     from digital_twin_pkg import DigitalTwinEngine
     from registry import get_paths, load_topology
 
@@ -47,8 +64,16 @@ def _get_or_init_dt_engine(site_id: str):
         return st.session_state[dt_key]
 
     try:
-        # グローバルキャッシュからエンジンを取得（初回のみ遅延インポートと重い初期化が走る）
-        engine = _get_cached_engine(site_id)
+        # ★修正: ロードしたトポロジからハッシュを計算して渡す
+        from registry import get_paths, load_topology
+        paths = get_paths(site_id)
+        current_topo = load_topology(paths.topology_path)
+        if current_topo:
+            current_topo_hash = _compute_topo_hash(current_topo)
+        else:
+            current_topo_hash = "empty"
+
+        engine = _get_cached_engine(site_id, current_topo_hash)
         
         if not engine:
             st.session_state[dt_key]  = None
