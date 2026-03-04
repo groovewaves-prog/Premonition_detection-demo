@@ -1,4 +1,4 @@
-# digital_twin_pkg/gnn.py - Graph Neural Network モジュール
+# digital_twin_pkg/gnn.py - Graph Neural Network モジュール (Heterogeneous GNN)
 
 from __future__ import annotations
 import logging
@@ -11,145 +11,107 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    from torch_geometric.nn import GCNConv, GATConv, global_mean_pool
-    from torch_geometric.data import Data, Batch
+    # ★変更: HeteroData, HeteroConv, Linear などを追加
+    from torch_geometric.nn import GATConv, SAGEConv, HeteroConv, Linear
+    from torch_geometric.data import HeteroData
     HAS_PYTORCH_GEOMETRIC = True
 except ImportError:
     HAS_PYTORCH_GEOMETRIC = False
     logger.warning("PyTorch Geometric not available. GNN features disabled.")
-    # Define dummy classes to prevent NameError
     nn = None
     F = None
 
 
 if HAS_PYTORCH_GEOMETRIC:
-    class NetworkGNN(nn.Module):
+    class HeteroNetworkGNN(nn.Module):
         """
-        ネットワークトポロジーのためのGraph Neural Network
+        ネットワークトポロジーのための Heterogeneous Graph Neural Network
         
-        ノード: ネットワーク機器
-        エッジ: 接続関係（親子、冗長性グループ）
-        特徴量: アラーム埋め込み、デバイス属性
+        エッジの種類に応じて異なるConvolutionを適用し、
+        「親子関係（波及）」と「冗長構成（補完）」をAIに区別させる。
         """
-        
         def __init__(
             self,
             input_dim: int = 768,  # BERT embedding dimension
             hidden_dim: int = 128,
             output_dim: int = 64,
             num_layers: int = 3,
-            dropout: float = 0.2,
-            use_attention: bool = True
+            dropout: float = 0.2
         ):
             super().__init__()
-            
-            self.input_dim = input_dim
-            self.hidden_dim = hidden_dim
-            self.output_dim = output_dim
-            self.num_layers = num_layers
             self.dropout = dropout
-            self.use_attention = use_attention
             
-            # Input projection
-            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            # ノード特徴量の次元削減（プロジェクション）
+            self.node_proj = Linear(input_dim, hidden_dim)
             
-            # GNN layers
+            # 異種グラフ畳み込み層 (HeteroConv)
             self.convs = nn.ModuleList()
-            self.bns = nn.ModuleList()
-            
             for i in range(num_layers):
-                in_channels = hidden_dim
-                out_channels = hidden_dim if i < num_layers - 1 else output_dim
-                
-                if use_attention:
-                    # Graph Attention Network
-                    conv = GATConv(in_channels, out_channels, heads=4, concat=False)
-                else:
-                    # Graph Convolutional Network
-                    conv = GCNConv(in_channels, out_channels)
-                
+                conv = HeteroConv({
+                    # 親子関係: カスケード障害の波及をAttention(GAT)で学習
+                    ('device', 'depends_on', 'device'): GATConv(-1, hidden_dim, add_self_loops=False),
+                    # 冗長関係: 互いの状態を平均化(SAGE)して補完関係を学習
+                    ('device', 'redundant_with', 'device'): SAGEConv(-1, hidden_dim)
+                }, aggr='sum')
                 self.convs.append(conv)
-                
-                if i < num_layers - 1:
-                    self.bns.append(nn.BatchNorm1d(out_channels))
             
-            # Output layers
-            self.fc_confidence = nn.Linear(output_dim, 1)
-            self.fc_time_to_failure = nn.Linear(output_dim, 1)
+            # 最終予測層
+            self.fc_confidence = nn.Linear(hidden_dim, 1)
+            self.fc_time_to_failure = nn.Linear(hidden_dim, 1)
         
-        def forward(self, x, edge_index, batch=None):
-            """
-            Args:
-                x: Node features [num_nodes, input_dim]
-                edge_index: Edge indices [2, num_edges]
-                batch: Batch assignment [num_nodes] (for batched graphs)
-            
-            Returns:
-                confidence: Predicted confidence [num_nodes, 1]
-                time_to_failure: Predicted time to failure [num_nodes, 1]
-            """
-            # Input projection
-            x = self.input_proj(x)
+        def forward(self, x_dict, edge_index_dict):
+            # 初期プロジェクション
+            x = self.node_proj(x_dict['device'])
             x = F.relu(x)
+            x_dict_current = {'device': x}
             
-            # GNN layers with residual connections
-            for i, conv in enumerate(self.convs):
-                x_in = x
-                x = conv(x, edge_index)
+            # GNNレイヤーの伝播 (Residual connections)
+            for conv in self.convs:
+                x_in = x_dict_current['device']
+                x_dict_current = conv(x_dict_current, edge_index_dict)
+                x_out = x_dict_current['device']
                 
-                if i < self.num_layers - 1:
-                    x = self.bns[i](x)
-                    x = F.relu(x)
-                    x = F.dropout(x, p=self.dropout, training=self.training)
-                    
-                    # Residual connection
-                    if x_in.shape == x.shape:
-                        x = x + x_in
+                x_out = F.relu(x_out)
+                x_out = F.dropout(x_out, p=self.dropout, training=self.training)
+                
+                # Residual connection
+                if x_in.shape == x_out.shape:
+                    x_out = x_out + x_in
+                
+                x_dict_current['device'] = x_out
             
-            # Output predictions
-            confidence = torch.sigmoid(self.fc_confidence(x))
-            time_to_failure = F.relu(self.fc_time_to_failure(x))
+            out = x_dict_current['device']
+            confidence = torch.sigmoid(self.fc_confidence(out))
+            time_to_failure = F.relu(self.fc_time_to_failure(out))
             
             return confidence, time_to_failure
 else:
-    # Dummy class when PyTorch Geometric is not available
-    class NetworkGNN:
-        """Dummy NetworkGNN class when PyTorch Geometric is not installed"""
-        def __init__(self, *args, **kwargs):
-            pass
+    class HeteroNetworkGNN:
+        """Dummy class when PyTorch Geometric is not installed"""
+        def __init__(self, *args, **kwargs): pass
 
 
 class GNNPredictionEngine:
-    """
-    GNNベースの予測エンジン
-    """
-    
     def __init__(
         self,
         topology: Dict[str, Any],
         children_map: Dict[str, List[str]],
         model_path: Optional[str] = None
     ):
-        """
-        Args:
-            topology: ネットワークトポロジー
-            children_map: 親子関係マップ
-            model_path: 学習済みモデルのパス（オプション）
-        """
         self.topology = topology
         self.children_map = children_map
         self.model = None
+        # トポロジキャッシュ用変数
+        self._cached_topology_structure = None 
         
         if not HAS_PYTORCH_GEOMETRIC:
             logger.warning("PyTorch Geometric not available. GNN features disabled.")
             return
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # ★変更: HeteroNetworkGNN に切り替え
+        self.model = HeteroNetworkGNN().to(self.device)
         
-        # Initialize model
-        self.model = NetworkGNN().to(self.device)
-        
-        # Load pretrained model if available
         if model_path:
             try:
                 self.model.load_state_dict(torch.load(model_path, map_location=self.device))
@@ -162,83 +124,76 @@ class GNNPredictionEngine:
         self,
         alarm_embeddings: Dict[str, np.ndarray],
         device_states: Optional[Dict[str, Dict]] = None
-    ) -> Optional[Data]:
-        """
-        トポロジーをPyTorch Geometric Dataに変換
-        
-        Args:
-            alarm_embeddings: デバイスIDごとのアラーム埋め込み
-            device_states: デバイスの状態情報（オプション）
-        
-        Returns:
-            PyTorch Geometric Data object
-        """
+    ) -> Optional[HeteroData]:
         if not HAS_PYTORCH_GEOMETRIC:
             return None
         
-        # Create node mapping
-        device_ids = list(self.topology.keys())
-        device_to_idx = {dev_id: idx for idx, dev_id in enumerate(device_ids)}
+        # ========================================================
+        # ★推論の効率化: グラフ構造のキャッシュ
+        # ネットワークの形(エッジ)は変わらないため、初回のみ計算する
+        # ========================================================
+        if self._cached_topology_structure is None:
+            device_ids = list(self.topology.keys())
+            device_to_idx = {dev_id: idx for idx, dev_id in enumerate(device_ids)}
+            
+            # 親子関係エッジ (depends_on)
+            depends_edges = []
+            for parent_id, children in self.children_map.items():
+                if parent_id not in device_to_idx: continue
+                p_idx = device_to_idx[parent_id]
+                for child_id in children:
+                    if child_id not in device_to_idx: continue
+                    c_idx = device_to_idx[child_id]
+                    depends_edges.append([p_idx, c_idx])
+                    depends_edges.append([c_idx, p_idx])
+            
+            # 冗長関係エッジ (redundant_with)
+            redundant_groups = {}
+            for dev_id, attrs in self.topology.items():
+                rg = attrs.get('redundancy_group') if isinstance(attrs, dict) else getattr(attrs, 'redundancy_group', None)
+                if rg:
+                    redundant_groups.setdefault(rg, []).append(device_to_idx[dev_id])
+            
+            redundant_edges = []
+            for members in redundant_groups.values():
+                for i in range(len(members)):
+                    for j in range(i + 1, len(members)):
+                        redundant_edges.append([members[i], members[j]])
+                        redundant_edges.append([members[j], members[i]])
+            
+            # エッジが0本の場合のエラー防止用ダミーエッジ
+            if not depends_edges: depends_edges = [[0, 0]]
+            if not redundant_edges: redundant_edges = [[0, 0]]
+            
+            self._cached_topology_structure = {
+                'device_ids': device_ids,
+                'device_to_idx': device_to_idx,
+                'depends_on': torch.tensor(depends_edges, dtype=torch.long).t().contiguous(),
+                'redundant_with': torch.tensor(redundant_edges, dtype=torch.long).t().contiguous()
+            }
         
-        # Create node features
+        cache = self._cached_topology_structure
+        device_ids = cache['device_ids']
+        
+        # ノード特徴量（アラーム情報）の構築のみ毎回実行
         node_features = []
         for dev_id in device_ids:
             if dev_id in alarm_embeddings:
                 feature = alarm_embeddings[dev_id]
             else:
-                # No alarm: use zero embedding
-                feature = np.zeros(768)  # BERT embedding dimension
-            
+                feature = np.zeros(768)
             node_features.append(feature)
         
         x = torch.tensor(np.array(node_features), dtype=torch.float)
         
-        # Create edges from parent-child relationships
-        edge_list = []
-        for parent_id, children in self.children_map.items():
-            if parent_id not in device_to_idx:
-                continue
-            parent_idx = device_to_idx[parent_id]
-            
-            for child_id in children:
-                if child_id not in device_to_idx:
-                    continue
-                child_idx = device_to_idx[child_id]
-                
-                # Bidirectional edges
-                edge_list.append([parent_idx, child_idx])
-                edge_list.append([child_idx, parent_idx])
+        # ★変更: HeteroData オブジェクトの構築
+        data = HeteroData()
+        data['device'].x = x
+        data['device', 'depends_on', 'device'].edge_index = cache['depends_on']
+        data['device', 'redundant_with', 'device'].edge_index = cache['redundant_with']
         
-        # Add redundancy group edges
-        redundancy_groups = {}
-        for dev_id, attrs in self.topology.items():
-            if isinstance(attrs, dict):
-                rg = attrs.get('redundancy_group')
-                if rg:
-                    if rg not in redundancy_groups:
-                        redundancy_groups[rg] = []
-                    if dev_id in device_to_idx:
-                        redundancy_groups[rg].append(device_to_idx[dev_id])
-        
-        # Connect devices in same redundancy group
-        for rg, members in redundancy_groups.items():
-            for i in range(len(members)):
-                for j in range(i + 1, len(members)):
-                    edge_list.append([members[i], members[j]])
-                    edge_list.append([members[j], members[i]])
-        
-        if not edge_list:
-            # No edges: create self-loops
-            edge_list = [[i, i] for i in range(len(device_ids))]
-        
-        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-        
-        # Create PyTorch Geometric Data
-        data = Data(x=x, edge_index=edge_index)
-        
-        # Add device IDs as metadata
         data.device_ids = device_ids
-        data.device_to_idx = device_to_idx
+        data.device_to_idx = cache['device_to_idx']
         
         return data
     
@@ -247,39 +202,21 @@ class GNNPredictionEngine:
         alarm_embeddings: Dict[str, np.ndarray],
         target_device_id: str
     ) -> Tuple[float, float]:
-        """
-        GNNを使った予測
-        
-        Args:
-            alarm_embeddings: デバイスIDごとのアラーム埋め込み
-            target_device_id: 予測対象のデバイスID
-        
-        Returns:
-            (confidence, time_to_failure_hours)
-        """
         if not HAS_PYTORCH_GEOMETRIC or self.model is None:
-            return 0.5, 336.0  # Default values
-        
-        # Convert topology to graph
-        data = self.topology_to_graph(alarm_embeddings)
-        if data is None:
             return 0.5, 336.0
         
-        # Get target device index
-        if target_device_id not in data.device_to_idx:
+        data = self.topology_to_graph(alarm_embeddings)
+        if data is None or target_device_id not in data.device_to_idx:
             return 0.5, 336.0
         
         target_idx = data.device_to_idx[target_device_id]
-        
-        # Move to device
         data = data.to(self.device)
         
-        # Predict
         self.model.eval()
         with torch.no_grad():
-            confidence, time_to_failure = self.model(data.x, data.edge_index)
+            # ★変更: 辞書型の特徴量とエッジを渡す
+            confidence, time_to_failure = self.model(data.x_dict, data.edge_index_dict)
         
-        # Extract predictions for target device
         target_confidence = float(confidence[target_idx].cpu().numpy())
         target_ttf = float(time_to_failure[target_idx].cpu().numpy())
         
@@ -291,20 +228,6 @@ class GNNPredictionEngine:
         epochs: int = 100,
         lr: float = 0.001
     ):
-        """
-        履歴データでGNNを学習
-        
-        Args:
-            training_data: 学習データ
-                [{
-                    'alarm_embeddings': {...},
-                    'device_id': str,
-                    'actual_failure': bool,
-                    'time_to_failure': float
-                }]
-            epochs: エポック数
-            lr: 学習率
-        """
         if not HAS_PYTORCH_GEOMETRIC or self.model is None:
             logger.warning("GNN training not available")
             return
@@ -314,29 +237,22 @@ class GNNPredictionEngine:
         criterion_ttf = nn.MSELoss()
         
         self.model.train()
-        
         for epoch in range(epochs):
             total_loss = 0.0
-            
             for sample in training_data:
                 optimizer.zero_grad()
                 
-                # Create graph
                 data = self.topology_to_graph(sample['alarm_embeddings'])
-                if data is None:
-                    continue
+                if data is None: continue
                 
                 data = data.to(self.device)
                 
-                # Forward pass
-                pred_conf, pred_ttf = self.model(data.x, data.edge_index)
+                # ★変更: 辞書型でForward
+                pred_conf, pred_ttf = self.model(data.x_dict, data.edge_index_dict)
                 
-                # Get target
                 target_idx = data.device_to_idx.get(sample['device_id'])
-                if target_idx is None:
-                    continue
+                if target_idx is None: continue
                 
-                # Calculate loss
                 target_conf = torch.tensor([1.0 if sample['actual_failure'] else 0.0],
                                           dtype=torch.float, device=self.device)
                 target_ttf_val = torch.tensor([sample['time_to_failure']],
@@ -344,13 +260,10 @@ class GNNPredictionEngine:
                 
                 loss_conf = criterion_confidence(pred_conf[target_idx], target_conf)
                 loss_ttf = criterion_ttf(pred_ttf[target_idx], target_ttf_val)
+                loss = loss_conf + 0.1 * loss_ttf
                 
-                loss = loss_conf + 0.1 * loss_ttf  # Weight TTF loss less
-                
-                # Backward pass
                 loss.backward()
                 optimizer.step()
-                
                 total_loss += loss.item()
             
             if (epoch + 1) % 10 == 0:
@@ -358,18 +271,11 @@ class GNNPredictionEngine:
                 logger.info(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
 
 
-# Utility function for integration
 def create_gnn_engine(topology: dict, children_map: dict) -> Optional[GNNPredictionEngine]:
-    """
-    GNN予測エンジンを作成
-    
-    PyTorch Geometricが利用できない場合はNoneを返す
-    """
     if not HAS_PYTORCH_GEOMETRIC:
         return None
-    
     try:
         return GNNPredictionEngine(topology, children_map)
     except Exception as e:
-        logger.error(f"Failed to create GNN engine: {e}")
+        logger.error(f"Failed to create Hetero GNN engine: {e}")
         return None
